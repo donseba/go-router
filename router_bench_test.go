@@ -10,7 +10,8 @@ import (
 // BenchmarkRouter measures the performance of the router under load.
 func BenchmarkRouter(b *testing.B) {
 	// Set up the router
-	router := NewDefault()
+	mux := http.NewServeMux()
+	router := New(mux, "Example API", "1.0.0")
 
 	// Register a large number of routes to simulate complexity
 	numRoutes := 1000

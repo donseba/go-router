@@ -1,13 +1,17 @@
 package router
 
 import (
+	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 )
 
 var (
 	DefaultRedirectTrailingSlash = true
+	DefaultUseOpenapiDocs        = false
+	OpenApiVersion               = "3.0.1"
 )
 
 type (
@@ -15,131 +19,107 @@ type (
 		mux                   *http.ServeMux
 		basePath              string
 		redirectTrailingSlash bool
+		openapiDocs           bool
 		middlewares           []Middleware
 		parent                *Router // Reference to the parent router
 
 		notFoundHandler         http.HandlerFunc
 		methodNotAllowedHandler http.HandlerFunc
+		internalServerError     http.HandlerFunc
 
-		routes map[string]*RouteInfo
-		docs   *RouteInfo
-		mu     sync.RWMutex
-
-		openapi *OpenAPI // <-- new openapi locations
-	}
-
-	RouteInfo struct {
-		Title       string       `json:"Title,omitempty"`
-		Description string       `json:"Description,omitempty"`
-		Params      []DocsParam  `json:"Params,omitempty"`
-		Path        string       `json:"Path,omitempty"`
-		Methods     []string     `json:"Methods,omitempty"`
-		Routes      []*RouteInfo `json:"Routes,omitempty"`
+		once    sync.Once
+		mu      sync.RWMutex
+		openapi *OpenAPI
 	}
 
 	Docs struct {
-		Title       string
-		Description string
-		Params      []DocsParam
+		Tags        []string              // Tags for the operation
+		Summary     string                // Short summary of the operation
+		Description string                // Operation description
+		Parameters  []Parameter           // Parameters for the operation
+		RequestBody *RequestBody          // Request body for the operation
+		Responses   map[string]Response   // Expected responses
+		Security    []map[string][]string // Security requirements
+
+		In  map[string]DocIn
+		Out map[string]DocOut
 	}
 
-	DocsParam struct {
-		Name        string `json:"Name,omitempty"`
-		Type        string `json:"Type,omitempty"`
-		Description string `json:"Description,omitempty"`
+	DocOut struct {
+		ApplicationType string
+		Description     string
+		Object          any
+	}
+
+	DocIn struct {
+		Object   any
+		Required bool
 	}
 
 	Middleware func(http.Handler) http.Handler
 )
 
-func New(ht *http.ServeMux) *Router {
+func New(ht *http.ServeMux, title string, version string) *Router {
 	return &Router{
 		mux:                   ht,
 		redirectTrailingSlash: DefaultRedirectTrailingSlash,
-		routes:                make(map[string]*RouteInfo),
-		docs: &RouteInfo{
-			Path:   "/",
-			Routes: []*RouteInfo{},
+		openapiDocs:           DefaultUseOpenapiDocs,
+		openapi: &OpenAPI{
+			Openapi: OpenApiVersion,
+			Info: Info{
+				Title:   title,
+				Version: version,
+			},
+			Servers: []Server{},
+			Paths:   make(map[string]PathItem),
+			Components: Components{
+				Schemas: make(map[string]Schema),
+			},
 		},
 	}
 }
 
-func NewDefault() *Router {
-	return &Router{
-		mux:                   http.NewServeMux(),
-		redirectTrailingSlash: DefaultRedirectTrailingSlash,
-		routes:                make(map[string]*RouteInfo),
-		docs: &RouteInfo{
-			Path:   "/",
-			Routes: []*RouteInfo{},
-		},
-	}
+func (r *Router) AddServerEndpoint(url string, description string) {
+	r.openapi.Servers = append(r.openapi.Servers, Server{
+		URL:         url,
+		Description: description,
+	})
 }
 
-func (r *Router) Get(pattern string, handler http.HandlerFunc, docs ...Docs) {
-	r.handle(http.MethodGet, pattern, handler, docs...)
+func (r *Router) Get(pattern string, handler http.HandlerFunc, doc ...Docs) {
+	r.handle(http.MethodGet, pattern, handler, doc...)
 }
 
-func (r *Router) Head(pattern string, handler http.HandlerFunc, docs ...Docs) {
-	r.handle(http.MethodHead, pattern, handler, docs...)
+func (r *Router) Head(pattern string, handler http.HandlerFunc, doc ...Docs) {
+	r.handle(http.MethodHead, pattern, handler, doc...)
 }
 
-func (r *Router) Post(pattern string, handler http.HandlerFunc, docs ...Docs) {
-	r.handle(http.MethodPost, pattern, handler, docs...)
+func (r *Router) Post(pattern string, handler http.HandlerFunc, doc ...Docs) {
+	r.handle(http.MethodPost, pattern, handler, doc...)
 }
 
-func (r *Router) Put(pattern string, handler http.HandlerFunc, docs ...Docs) {
-	r.handle(http.MethodPut, pattern, handler, docs...)
+func (r *Router) Put(pattern string, handler http.HandlerFunc, doc ...Docs) {
+	r.handle(http.MethodPut, pattern, handler, doc...)
 }
 
-func (r *Router) Patch(pattern string, handler http.HandlerFunc, docs ...Docs) {
-	r.handle(http.MethodPatch, pattern, handler, docs...)
+func (r *Router) Patch(pattern string, handler http.HandlerFunc, doc ...Docs) {
+	r.handle(http.MethodPatch, pattern, handler, doc...)
 }
 
-func (r *Router) Delete(pattern string, handler http.HandlerFunc, docs ...Docs) {
-	r.handle(http.MethodDelete, pattern, handler, docs...)
+func (r *Router) Delete(pattern string, handler http.HandlerFunc, doc ...Docs) {
+	r.handle(http.MethodDelete, pattern, handler, doc...)
 }
 
-func (r *Router) Group(basePath string, fn func(*Router), docs ...Docs) {
+func (r *Router) Group(basePath string, fn func(*Router), op ...Operation) {
 	subRouter := &Router{
-		mux:                     r.mux,
 		basePath:                r.basePath + basePath,
 		redirectTrailingSlash:   r.redirectTrailingSlash,
 		middlewares:             append([]Middleware{}, r.middlewares...),
 		parent:                  r,
 		notFoundHandler:         r.notFoundHandler,
 		methodNotAllowedHandler: r.methodNotAllowedHandler,
+		openapiDocs:             r.openapiDocs,
 	}
-
-	// Create RouteInfo for this group
-	groupPath := subRouter.basePath
-	groupDocs := &RouteInfo{
-		Path:   groupPath,
-		Routes: []*RouteInfo{},
-	}
-
-	if len(docs) > 0 {
-		groupDocs.Title = docs[0].Title
-		groupDocs.Description = docs[0].Description
-		groupDocs.Params = docs[0].Params
-	}
-
-	// Add the group's RouteInfo to the parent's docs
-	if r.docs != nil {
-		r.docs.Routes = append(r.docs.Routes, groupDocs)
-	} else {
-		rootRouter := r.rootParent()
-		rootRouter.docs.Routes = append(rootRouter.docs.Routes, groupDocs)
-	}
-
-	// Store in routes map
-	rootRouter := r.rootParent()
-	rootRouter.mu.Lock()
-	rootRouter.routes[groupPath] = groupDocs
-	rootRouter.mu.Unlock()
-
-	// Assign the docs to the subRouter
-	subRouter.docs = groupDocs
 
 	fn(subRouter)
 }
@@ -148,12 +128,20 @@ func (r *Router) RedirectTrailingSlash(redirect bool) {
 	r.redirectTrailingSlash = redirect
 }
 
+func (r *Router) UseOpenapiDocs(use bool) {
+	r.openapiDocs = use
+}
+
 func (r *Router) MethodNotAllowed(handler http.HandlerFunc) {
 	r.methodNotAllowedHandler = handler
 }
 
 func (r *Router) NotFound(handler http.HandlerFunc) {
 	r.notFoundHandler = handler
+}
+
+func (r *Router) InternalServerError(handler http.HandlerFunc) {
+	r.internalServerError = handler
 }
 
 func (r *Router) Use(middleware Middleware) {
@@ -165,7 +153,7 @@ func (r *Router) ServeFiles(pattern string, fs http.FileSystem) {
 		pattern = r.basePath + pattern
 	}
 
-	// Ensure pattern ends with "/" for directory serving
+	// Ensure the pattern ends with "/" for directory serving
 	if pattern == "" || pattern[len(pattern)-1] != '/' {
 		pattern += "/"
 	}
@@ -205,6 +193,16 @@ func (r *Router) ServeFile(pattern string, filepath string) {
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	// just before serving add all the option handlers based on the openapi paths
+	if r.openapiDocs {
+		r.once.Do(func() {
+			for p, _ := range r.openapi.Paths {
+				fmt.Println("Registering options handler for", p)
+				r.registerOptionsHandler(p)
+			}
+		})
+	}
+
 	if r.redirectTrailingSlash {
 		if req.URL.Path != "/" && req.URL.Path[len(req.URL.Path)-1] == '/' {
 			http.Redirect(w, req, req.URL.Path[:len(req.URL.Path)-1], http.StatusMovedPermanently)
@@ -223,6 +221,9 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		intercept405: func() bool {
 			return r.methodNotAllowedHandler != nil && w.Header().Get(HeaderFlagDoNotIntercept) == ""
 		},
+		intercept500: func() bool {
+			return r.internalServerError != nil && w.Header().Get(HeaderFlagDoNotIntercept) == ""
+		},
 	}
 
 	r.mux.ServeHTTP(interceptor, req)
@@ -230,6 +231,8 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	switch {
 	case interceptor.intercepted && interceptor.statusCode == http.StatusNotFound:
 		r.notFoundHandler.ServeHTTP(interceptor.ResponseWriter, req)
+	case interceptor.intercepted && interceptor.statusCode == http.StatusInternalServerError:
+		r.internalServerError.ServeHTTP(interceptor.ResponseWriter, req)
 	case interceptor.intercepted && interceptor.statusCode == http.StatusMethodNotAllowed:
 		// Set the Allow header
 		pattern := req.URL.Path
@@ -246,62 +249,101 @@ func (r *Router) handle(method, pattern string, handler http.HandlerFunc, docs .
 	if r.basePath != "" {
 		pattern = r.basePath + pattern
 	}
+
 	if pattern == "" {
 		pattern = "/"
 	} else if pattern[0] != '/' {
 		pattern = "/" + pattern
 	}
 
-	fullPattern := method + " " + pattern
+	r.registerRoute(method, pattern, handler)
+	if r.openapiDocs {
+		r.registerDocs(method, pattern, docs...)
+	}
+}
 
-	var finalHandler http.Handler = handler
+func (r *Router) registerRoute(method, pattern string, handler http.HandlerFunc) {
+	var (
+		fullPattern               = method + " " + pattern
+		finalHandler http.Handler = handler
+	)
+
 	for i := len(r.middlewares) - 1; i >= 0; i-- {
 		finalHandler = r.middlewares[i](finalHandler)
 	}
 
-	// Register OPTIONS handler
-	r.registerOptionsHandler(pattern)
+	rootRouter := r.rootParent()
+	rootRouter.mu.Lock()
+	defer rootRouter.mu.Unlock()
+
+	rootRouter.mux.Handle(fullPattern, finalHandler)
+	return
+}
+
+func (r *Router) registerDocs(method, pattern string, docs ...Docs) string {
+	if len(docs) == 0 {
+		return ""
+	}
+
+	var (
+		stripPattern = strings.ReplaceAll(pattern, "{$}", "") //strip {$} from the pattern for the docs
+		doc          = &docs[0]
+	)
 
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()
 	defer rootRouter.mu.Unlock()
 
 	// Get or create RouteInfo for the pattern
-	routeInfo, exists := rootRouter.routes[pattern]
+	pathItem, exists := rootRouter.openapi.Paths[pattern]
 	if !exists {
-		// Create new RouteInfo
-		routeInfo = &RouteInfo{
-			Path:    pattern,
-			Methods: []string{method},
-		}
+		pathItem = PathItem{}
+	}
 
-		if len(docs) > 0 {
-			routeInfo.Title = docs[0].Title
-			routeInfo.Description = docs[0].Description
-			routeInfo.Params = docs[0].Params
-		}
+	op := &Operation{
+		Tags:        doc.Tags,
+		Summary:     doc.Summary,
+		Description: doc.Description,
+		OperationID: fmt.Sprintf("%s%s", method, r.OperationID(stripPattern)),
+		Parameters:  doc.Parameters,
+		RequestBody: doc.RequestBody,
+		Responses:   doc.Responses,
+		Security:    doc.Security,
+	}
 
-		// Add to the current router's docs
-		if r.docs != nil {
-			r.docs.Routes = append(r.docs.Routes, routeInfo)
-		} else {
-			rootRouter.docs.Routes = append(rootRouter.docs.Routes, routeInfo)
-		}
-
-		// Store in routes map
-		rootRouter.routes[pattern] = routeInfo
-	} else {
-		// Update existing RouteInfo
-		routeInfo.Methods = appendIfMissing(routeInfo.Methods, method)
-		if len(docs) > 0 {
-			// Update Title, Description, Params if provided
-			routeInfo.Title = docs[0].Title
-			routeInfo.Description = docs[0].Description
-			routeInfo.Params = docs[0].Params
+	// handle doc out
+	componentSchema, routeResponse := r.handleDocOut(doc.Out, rootRouter.openapi.Components.Schemas)
+	if componentSchema != nil {
+		for na, cs := range componentSchema {
+			if _, ex := rootRouter.openapi.Components.Schemas[na]; ex {
+				continue
+			}
+			rootRouter.openapi.Components.Schemas[na] = cs
 		}
 	}
 
-	rootRouter.mux.Handle(fullPattern, finalHandler)
+	if routeResponse != nil {
+		op.Responses = routeResponse
+	}
+
+	// handle doc in
+	componentSchema, requestBody := r.handleDocIn(doc.In, rootRouter.openapi.Components.Schemas)
+	if componentSchema != nil {
+		for na, cs := range componentSchema {
+			if _, ex := rootRouter.openapi.Components.Schemas[na]; ex {
+				continue
+			}
+			rootRouter.openapi.Components.Schemas[na] = cs
+		}
+	}
+
+	if requestBody != nil {
+		op.RequestBody = requestBody
+	}
+
+	rootRouter.openapi.Paths[stripPattern] = pathItem.SetMethod(method, op)
+
+	return stripPattern
 }
 
 func (r *Router) rootParent() *Router {
@@ -309,6 +351,16 @@ func (r *Router) rootParent() *Router {
 		return r
 	}
 	return r.parent.rootParent()
+}
+
+func PrependIfMissing(slice []string, s string) []string {
+	for _, item := range slice {
+		if item == s {
+			return slice
+		}
+	}
+
+	return append([]string{s}, slice...)
 }
 
 func appendIfMissing(slice []string, s string) []string {
@@ -324,10 +376,26 @@ func (r *Router) getMethodsForPattern(pattern string) []string {
 	rootRouter := r.rootParent()
 	rootRouter.mu.RLock()
 	defer rootRouter.mu.RUnlock()
-	if routeInfo, exists := rootRouter.routes[pattern]; exists {
-		return routeInfo.Methods
+
+	var methods []string
+	if routeInfo, exists := rootRouter.openapi.Paths[pattern]; exists {
+		if routeInfo.Get != nil {
+			methods = appendIfMissing(methods, http.MethodGet)
+		}
+		if routeInfo.Post != nil {
+			methods = appendIfMissing(methods, http.MethodPost)
+		}
+		if routeInfo.Put != nil {
+			methods = appendIfMissing(methods, http.MethodPut)
+		}
+		if routeInfo.Delete != nil {
+			methods = appendIfMissing(methods, http.MethodDelete)
+		}
+		if routeInfo.Patch != nil {
+			methods = appendIfMissing(methods, http.MethodPatch)
+		}
 	}
-	return nil
+	return methods
 }
 
 func (r *Router) registerOptionsHandler(pattern string) {
@@ -335,44 +403,172 @@ func (r *Router) registerOptionsHandler(pattern string) {
 	rootRouter.mu.Lock()
 	defer rootRouter.mu.Unlock()
 
-	fullPattern := "OPTIONS " + pattern
-
-	// Check if OPTIONS handler is already registered
-	if _, exists := rootRouter.routes[fullPattern]; exists {
-		return
-	}
-
 	// Get methods for the pattern
-	routeInfo, exists := rootRouter.routes[pattern]
-	if !exists || len(routeInfo.Methods) == 0 {
+	routeInfo, exists := rootRouter.openapi.Paths[pattern]
+	if !exists || len(routeInfo.Methods()) == 0 {
 		return
 	}
 
-	methods := appendIfMissing(routeInfo.Methods, http.MethodOptions)
-
-	// Create the OPTIONS handler
+	// Create the OPTIONS handler with the Allow header
+	methods := PrependIfMissing(routeInfo.Methods(), http.MethodOptions)
 	optionsHandler := func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Allow", strings.Join(methods, ", "))
 		w.WriteHeader(http.StatusNoContent)
 	}
 
 	// Register the handler
-	rootRouter.mux.HandleFunc(fullPattern, optionsHandler)
+	rootRouter.mux.HandleFunc("OPTIONS "+pattern, optionsHandler)
+}
 
-	// Store the OPTIONS handler in routes
-	rootRouter.routes[fullPattern] = &RouteInfo{
-		Path:    pattern,
-		Methods: []string{http.MethodOptions},
+func (r *Router) OperationID(s string) string {
+	if s == "" || s == "/" {
+		s = "root"
 	}
+
+	parts := strings.Split(s, "/")
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		part = strings.TrimRight(strings.TrimLeft(part, "{"), "}")
+		parts[i] = strings.Title(part)
+	}
+	return strings.Join(parts, "")
 }
 
-func (r *Router) GetRoutes() map[string]*RouteInfo {
-	rootRouter := r.rootParent()
-	return rootRouter.routes
+func (r *Router) handleDocOut(do map[string]DocOut, schemas map[string]Schema) (map[string]Schema, map[string]Response) {
+	var (
+		componentSchemas map[string]Schema
+		routeResponse    map[string]Response
+	)
+
+	if do == nil {
+		return nil, nil
+	}
+
+	for responseCode, docOut := range do {
+		obj := reflect.ValueOf(docOut.Object)
+		if obj.Kind() == reflect.Ptr {
+			obj = obj.Elem()
+		}
+
+		pType := "object"
+		name := obj.Type().Name()
+		schema := Schema{
+			Ref: fmt.Sprintf("#/components/schemas/%s", name),
+		}
+
+		if _, ok := schemas[name]; !ok {
+			if obj.Kind() == reflect.Slice {
+				pType = "array"
+				elementType := obj.Type().Elem()
+				obj = reflect.New(elementType).Elem()
+				name = obj.Type().Name()
+				schema = Schema{
+					Type: pType,
+					Items: &Schema{
+						Ref: fmt.Sprintf("#/components/schemas/%s", name),
+					},
+				}
+			}
+
+			properties := make(map[string]Schema)
+
+			for i := 0; i < obj.NumField(); i++ {
+				field := obj.Field(i)
+				fieldName := obj.Type().Field(i).Name
+				fieldType := field.Type().Name()
+
+				properties[fieldName] = Schema{
+					Type: fieldType,
+				}
+			}
+
+			if componentSchemas == nil {
+				componentSchemas = make(map[string]Schema)
+			}
+
+			componentSchemas[name] = Schema{
+				Type:       pType,
+				Properties: properties,
+			}
+		}
+
+		if routeResponse == nil {
+			routeResponse = make(map[string]Response)
+		}
+
+		routeResponse[responseCode] = Response{
+			Description: docOut.Description,
+			Content: map[string]MediaType{
+				docOut.ApplicationType: {
+					Schema: &schema,
+				},
+			},
+		}
+	}
+
+	return componentSchemas, routeResponse
+
 }
 
-// GetDocs returns the root documentation tree
-func (r *Router) GetDocs() *RouteInfo {
+func (r *Router) handleDocIn(do map[string]DocIn, schemas map[string]Schema) (map[string]Schema, *RequestBody) {
+	var (
+		componentSchemas map[string]Schema
+		requestBody      *RequestBody
+	)
+
+	if do == nil {
+		return nil, nil
+	}
+
+	for contentType, docIn := range do {
+		obj := reflect.ValueOf(docIn.Object)
+		if obj.Kind() == reflect.Ptr {
+			obj = obj.Elem()
+		}
+
+		name := obj.Type().Name()
+		if _, ok := schemas[name]; !ok {
+			properties := make(map[string]Schema)
+			for i := 0; i < obj.NumField(); i++ {
+				field := obj.Field(i)
+				fieldName := obj.Type().Field(i).Name
+				fieldType := field.Type().Name()
+
+				properties[fieldName] = Schema{
+					Type: fieldType,
+				}
+			}
+
+			if componentSchemas == nil {
+				componentSchemas = make(map[string]Schema)
+			}
+
+			componentSchemas[name] = Schema{
+				Type:       "object",
+				Properties: properties,
+			}
+		}
+
+		if requestBody == nil {
+			requestBody = &RequestBody{
+				Content: make(map[string]MediaType),
+			}
+		}
+
+		requestBody.Content[contentType] = MediaType{
+			Schema: &Schema{
+				Ref: fmt.Sprintf("#/components/schemas/%s", name),
+			},
+		}
+	}
+
+	return componentSchemas, requestBody
+}
+
+// OpenAPI returns the root documentation tree
+func (r *Router) OpenAPI() *OpenAPI {
 	rootRouter := r.rootParent()
-	return rootRouter.docs
+	return rootRouter.openapi
 }

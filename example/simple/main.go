@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -11,7 +10,8 @@ import (
 )
 
 func main() {
-	r := router.NewDefault()
+	mux := http.NewServeMux()
+	r := router.New(mux, "Example API", "1.0.0")
 
 	// Apply global middleware
 	r.Use(middleware.Timer)
@@ -25,45 +25,26 @@ func main() {
 	r.MethodNotAllowed(methodNotAllowedHandler)
 
 	// Define routes
-	r.Get("/{$}", homeHandler, router.Docs{
-		Title:       "Home Page",
-		Description: "Displays the home page.",
-	}) // only listen to the root path
-	r.Get("/gopher", gopherHandler, router.Docs{
-		Title:       "Gopher Page",
-		Description: "Displays a gopher image.",
-	})
+	r.Get("/{$}", homeHandler)
+	r.Get("/gopher", gopherHandler)
 	r.Post("/login", loginHandler)
 
 	r.Group("/users", func(r *router.Router) {
 		r.Get("", userListHandler)
-		r.Get("/{id}", userHandler, router.Docs{
-			Title:       "Get User",
-			Description: "Retrieves a user by ID.",
-			Params: []router.DocsParam{
-				{Name: "id", Type: "string", Description: "The ID of the user."},
-			},
+		r.Get("/{id}", userHandler)
+
+		r.Put("/{id}", func(w http.ResponseWriter, req *http.Request) {
+			_, _ = fmt.Fprintln(w, "Update User")
+		})
+
+		r.Post("", func(w http.ResponseWriter, req *http.Request) {
+			_, _ = fmt.Fprintln(w, "Create User")
 		})
 	})
 
-	r.Get("/docs", func(w http.ResponseWriter, req *http.Request) {
-		docs := r.GetDocs()
-
-		out, err := json.MarshalIndent(docs, "", "  ")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		_, _ = fmt.Fprint(w, string(out))
-	}, router.Docs{
-		Title:       "API Documentation",
-		Description: "Returns the API documentation.",
-	})
-
 	// Start the server
-	log.Println("Server is running at :3210")
-	err := http.ListenAndServe(":3210", r)
+	log.Println("Server is running at :3211")
+	err := http.ListenAndServe(":3211", r)
 	if err != nil {
 		log.Fatal(err)
 	}

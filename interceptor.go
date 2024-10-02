@@ -37,6 +37,7 @@ type routingStatusInterceptWriter struct {
 
 	intercept404 func() bool
 	intercept405 func() bool
+	intercept500 func() bool
 
 	statusCode  int
 	intercepted bool
@@ -50,7 +51,8 @@ func (w *routingStatusInterceptWriter) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 
 	if (w.intercept404() && statusCode == http.StatusNotFound) ||
-		(w.intercept405() && statusCode == http.StatusMethodNotAllowed) {
+		(w.intercept405() && statusCode == http.StatusMethodNotAllowed) ||
+		(w.intercept500() && statusCode == http.StatusInternalServerError) {
 
 		w.intercepted = true
 		return

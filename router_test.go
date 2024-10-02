@@ -22,7 +22,8 @@ type testStruct struct {
 }
 
 func TestRouter(t *testing.T) {
-	r := NewDefault()
+	mux := http.NewServeMux()
+	r := New(mux, "Example API", "1.0.0")
 
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "whoopsiedaisy page not found", http.StatusNotFound)

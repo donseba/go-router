@@ -31,6 +31,44 @@ type PathItem struct {
 	Post   *Operation `json:"post,omitempty"`   // POST operation
 	Put    *Operation `json:"put,omitempty"`    // PUT operation
 	Delete *Operation `json:"delete,omitempty"` // DELETE operation
+	Patch  *Operation `json:"patch,omitempty"`  // PATCH operation
+}
+
+func (p PathItem) Methods() []string {
+	var methods []string
+	if p.Get != nil {
+		methods = append(methods, "GET")
+	}
+	if p.Post != nil {
+		methods = append(methods, "POST")
+	}
+	if p.Put != nil {
+		methods = append(methods, "PUT")
+	}
+	if p.Delete != nil {
+		methods = append(methods, "DELETE")
+	}
+	if p.Patch != nil {
+		methods = append(methods, "PATCH")
+	}
+	return methods
+}
+
+func (p PathItem) SetMethod(method string, operation *Operation) PathItem {
+	switch method {
+	case "GET":
+		p.Get = operation
+	case "POST":
+		p.Post = operation
+	case "PUT":
+		p.Put = operation
+	case "DELETE":
+		p.Delete = operation
+	case "PATCH":
+		p.Patch = operation
+	}
+
+	return p
 }
 
 // Operation describes a single API operation on a path.
@@ -74,6 +112,7 @@ type MediaType struct {
 
 // Schema represents the structure of a request or response body.
 type Schema struct {
+	Ref        string            `json:"$ref,omitempty"`       // Reference to a schema
 	Type       string            `json:"type,omitempty"`       // Data type (e.g., "string", "object")
 	Format     string            `json:"format,omitempty"`     // Data format (e.g., "uuid", "email")
 	Properties map[string]Schema `json:"properties,omitempty"` // Properties of the object

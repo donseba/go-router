@@ -6,7 +6,7 @@ go-router is a lightweight, flexible, and idiomatic HTTP router for Go web appli
 - **Method-Based Routing**: Easily define routes for `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, and `HEAD` methods.
 - **Route Grouping**: Organize routes under common base paths using groups.
 - **Middleware Support**: Apply middleware functions globally or per group.
-- **Custom 404 and 405 Handlers**: Set custom handlers for NotFound (404) and MethodNotAllowed (405) responses.
+- **Custom 404, 405 and 500 Handlers**: Set custom handlers for NotFound (404) and MethodNotAllowed (405) responses.
 - **Trailing Slash Handling**: Configure automatic redirection of trailing slashes.
 - **Static File Serving**: Serve static files and directories seamlessly.
 - **Built on Standard Library**: Utilizes Go's net/http package, ensuring performance and reliability.
@@ -182,13 +182,14 @@ admin.Get("/dashboard", adminDashboardHandler)
 })
 ```
 
-### Custom Handlers for 404 and 405 Responses
+### Custom Handlers for 404 and 405 and 500 Responses
 
 Set custom handlers to provide consistent error responses.
 
 ```go
 r.NotFound(notFoundHandler)
 r.MethodNotAllowed(methodNotAllowedHandler)
+r.InternalServerError(internalServerErrorHandler)
 ```
 
 ### Trailing Slash Handling
