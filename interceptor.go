@@ -1,21 +1,9 @@
 package router
 
-import "net/http"
+import (
+	"net/http"
+)
 
-// HeaderFlagDoNotIntercept defines a header that is (unfortunately) to be used
-// as a flag of sorts, to denote to this routing engine to not intercept the
-// response that is being written. It's an unfortunate artifact of an
-// implementation detail within the standard library's net/http.ServeMux for how
-// HTTP 404 and 405 responses can be customized, which requires writing a custom
-// response writer and preventing the standard library from just writing it's
-// own hard-coded response.
-//
-// See:
-//   - https://github.com/golang/go/issues/10123
-//   - https://github.com/golang/go/issues/21548
-//   - https://github.com/golang/go/issues/65648
-//
-// Author : https://github.com/Rican7 ( https://github.com/golang/go/issues/65648#issuecomment-2100088200 )
 const HeaderFlagDoNotIntercept = "do_not_intercept"
 
 type excludeHeaderWriter struct {
@@ -35,12 +23,9 @@ func (w *excludeHeaderWriter) WriteHeader(statusCode int) {
 type routingStatusInterceptWriter struct {
 	http.ResponseWriter
 
-	intercept404 func() bool
-	intercept405 func() bool
-	intercept500 func() bool
-
-	statusCode  int
-	intercepted bool
+	interceptMap map[int]func() bool
+	statusCode   int
+	intercepted  bool
 }
 
 func (w *routingStatusInterceptWriter) WriteHeader(statusCode int) {
@@ -49,13 +34,15 @@ func (w *routingStatusInterceptWriter) WriteHeader(statusCode int) {
 	}
 
 	w.statusCode = statusCode
+	for code, fn := range w.interceptMap {
+		if w.intercepted {
+			return
+		}
 
-	if (w.intercept404() && statusCode == http.StatusNotFound) ||
-		(w.intercept405() && statusCode == http.StatusMethodNotAllowed) ||
-		(w.intercept500() && statusCode == http.StatusInternalServerError) {
-
-		w.intercepted = true
-		return
+		if code == statusCode && fn() {
+			w.intercepted = true
+			return
+		}
 	}
 
 	w.ResponseWriter.WriteHeader(statusCode)
