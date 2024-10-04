@@ -1,5 +1,7 @@
 package router
 
+import "net/http"
+
 // OpenAPI represents the root OpenAPI document.
 type OpenAPI struct {
 	Openapi    string                `json:"openapi" validate:"required"` // OpenAPI version (e.g., "3.0.1")
@@ -56,15 +58,15 @@ func (p PathItem) Methods() []string {
 
 func (p PathItem) SetMethod(method string, operation *Operation) PathItem {
 	switch method {
-	case "GET":
+	case http.MethodGet:
 		p.Get = operation
-	case "POST":
+	case http.MethodPost:
 		p.Post = operation
-	case "PUT":
+	case http.MethodPut:
 		p.Put = operation
-	case "DELETE":
+	case http.MethodDelete:
 		p.Delete = operation
-	case "PATCH":
+	case http.MethodPatch:
 		p.Patch = operation
 	}
 

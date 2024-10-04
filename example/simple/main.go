@@ -15,14 +15,20 @@ func main() {
 
 	// Apply global middleware
 	r.Use(middleware.Timer)
+	r.Use(middleware.Recover)
 
 	// Serve static files
 	r.ServeFiles("/file/", http.Dir("./files"))
 	r.ServeFile("/favicon.ico", "./files/favicon.ico")
 
-	// Set custom handlers
-	r.NotFound(notFoundHandler)
-	r.MethodNotAllowed(methodNotAllowedHandler)
+	// Set custom handlers from methods
+	r.HandleStatus(http.StatusNotFound, notFoundHandler)
+	r.HandleStatus(http.StatusMethodNotAllowed, methodNotAllowedHandler)
+
+	// set custom handler inlining
+	r.HandleStatus(http.StatusInternalServerError, func(w http.ResponseWriter, req *http.Request) {
+		http.Error(w, "Custom 500 - Internal Server Error", http.StatusInternalServerError)
+	})
 
 	// Define routes
 	r.Get("/{$}", homeHandler)
@@ -30,6 +36,17 @@ func main() {
 	r.Post("/login", loginHandler)
 
 	r.Group("/users", func(r *router.Router) {
+		// custom middleware for this group
+		r.Use(func(next http.Handler) http.Handler {
+			fn := func(w http.ResponseWriter, r *http.Request) {
+				log.Print("[go-router] user middleware")
+
+				next.ServeHTTP(w, r)
+
+			}
+
+			return http.HandlerFunc(fn)
+		})
 		r.Get("", userListHandler)
 		r.Get("/{id}", userHandler)
 
@@ -40,6 +57,10 @@ func main() {
 		r.Post("", func(w http.ResponseWriter, req *http.Request) {
 			_, _ = fmt.Fprintln(w, "Create User")
 		})
+	})
+
+	r.Get("/panic", func(w http.ResponseWriter, req *http.Request) {
+		panic("Panic!")
 	})
 
 	// Start the server

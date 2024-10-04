@@ -25,11 +25,11 @@ func TestRouter(t *testing.T) {
 	mux := http.NewServeMux()
 	r := New(mux, "Example API", "1.0.0")
 
-	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+	r.HandleStatus(http.StatusNotFound, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "whoopsiedaisy page not found", http.StatusNotFound)
 	})
 
-	r.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+	r.HandleStatus(http.StatusMethodNotAllowed, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "whoopsiedaisy method not allowed", http.StatusMethodNotAllowed)
 	})
 

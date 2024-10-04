@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 )
 
 var (
-	DefaultRedirectTrailingSlash = true
+	DefaultRedirectTrailingSlash = false
+	DefaultRedirectStatusCode    = http.StatusTemporaryRedirect // or http.StatusMovedPermanently
 	DefaultUseOpenapiDocs        = false
 	OpenApiVersion               = "3.0.1"
 )
@@ -23,9 +25,8 @@ type (
 		middlewares           []Middleware
 		parent                *Router // Reference to the parent router
 
-		notFoundHandler         http.HandlerFunc
-		methodNotAllowedHandler http.HandlerFunc
-		internalServerError     http.HandlerFunc
+		handleStatus map[int]http.HandlerFunc
+		patternMap   map[string]string
 
 		once    sync.Once
 		mu      sync.RWMutex
@@ -76,6 +77,8 @@ func New(ht *http.ServeMux, title string, version string) *Router {
 				Schemas: make(map[string]Schema),
 			},
 		},
+		handleStatus: make(map[int]http.HandlerFunc),
+		patternMap:   make(map[string]string),
 	}
 }
 
@@ -110,15 +113,14 @@ func (r *Router) Delete(pattern string, handler http.HandlerFunc, doc ...Docs) {
 	r.handle(http.MethodDelete, pattern, handler, doc...)
 }
 
-func (r *Router) Group(basePath string, fn func(*Router), op ...Operation) {
+func (r *Router) Group(basePath string, fn func(*Router)) {
 	subRouter := &Router{
-		basePath:                r.basePath + basePath,
-		redirectTrailingSlash:   r.redirectTrailingSlash,
-		middlewares:             append([]Middleware{}, r.middlewares...),
-		parent:                  r,
-		notFoundHandler:         r.notFoundHandler,
-		methodNotAllowedHandler: r.methodNotAllowedHandler,
-		openapiDocs:             r.openapiDocs,
+		basePath:              r.basePath + basePath,
+		redirectTrailingSlash: r.redirectTrailingSlash,
+		middlewares:           append([]Middleware{}, r.middlewares...),
+		parent:                r,
+		openapiDocs:           r.openapiDocs,
+		handleStatus:          r.handleStatus,
 	}
 
 	fn(subRouter)
@@ -132,16 +134,8 @@ func (r *Router) UseOpenapiDocs(use bool) {
 	r.openapiDocs = use
 }
 
-func (r *Router) MethodNotAllowed(handler http.HandlerFunc) {
-	r.methodNotAllowedHandler = handler
-}
-
-func (r *Router) NotFound(handler http.HandlerFunc) {
-	r.notFoundHandler = handler
-}
-
-func (r *Router) InternalServerError(handler http.HandlerFunc) {
-	r.internalServerError = handler
+func (r *Router) HandleStatus(httpStatus int, handler http.HandlerFunc) {
+	r.handleStatus[httpStatus] = handler
 }
 
 func (r *Router) Use(middleware Middleware) {
@@ -205,7 +199,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if r.redirectTrailingSlash {
 		if req.URL.Path != "/" && req.URL.Path[len(req.URL.Path)-1] == '/' {
-			http.Redirect(w, req, req.URL.Path[:len(req.URL.Path)-1], http.StatusMovedPermanently)
+			http.Redirect(w, req, req.URL.Path[:len(req.URL.Path)-1], DefaultRedirectStatusCode)
 			return
 		}
 	}
@@ -215,33 +209,33 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 			ResponseWriter:  w,
 			excludedHeaders: []string{HeaderFlagDoNotIntercept},
 		},
-		intercept404: func() bool {
-			return r.notFoundHandler != nil && w.Header().Get(HeaderFlagDoNotIntercept) == ""
-		},
-		intercept405: func() bool {
-			return r.methodNotAllowedHandler != nil && w.Header().Get(HeaderFlagDoNotIntercept) == ""
-		},
-		intercept500: func() bool {
-			return r.internalServerError != nil && w.Header().Get(HeaderFlagDoNotIntercept) == ""
-		},
+		interceptMap: make(map[int]func() bool),
+	}
+
+	for k, v := range r.handleStatus {
+		interceptor.interceptMap[k] = func() bool {
+			return v != nil && w.Header().Get(HeaderFlagDoNotIntercept) == ""
+		}
 	}
 
 	r.mux.ServeHTTP(interceptor, req)
 
-	switch {
-	case interceptor.intercepted && interceptor.statusCode == http.StatusNotFound:
-		r.notFoundHandler.ServeHTTP(interceptor.ResponseWriter, req)
-	case interceptor.intercepted && interceptor.statusCode == http.StatusInternalServerError:
-		r.internalServerError.ServeHTTP(interceptor.ResponseWriter, req)
-	case interceptor.intercepted && interceptor.statusCode == http.StatusMethodNotAllowed:
-		// Set the Allow header
-		pattern := req.URL.Path
-		allowedMethods := r.getMethodsForPattern(pattern)
-		if len(allowedMethods) > 0 {
-			interceptor.ResponseWriter.Header().Set("Allow", strings.Join(allowedMethods, ", "))
-		}
+	if interceptor.intercepted {
+		switch {
+		case interceptor.statusCode == http.StatusMethodNotAllowed:
+			// Set the Allow header
+			pattern := req.URL.Path
+			allowedMethods := r.getMethodsForPattern(pattern)
+			if len(allowedMethods) > 0 {
+				interceptor.ResponseWriter.Header().Set("Allow", strings.Join(allowedMethods, ", "))
+			}
 
-		r.methodNotAllowedHandler.ServeHTTP(interceptor.ResponseWriter, req)
+			r.handleStatus[http.StatusMethodNotAllowed].ServeHTTP(interceptor.ResponseWriter, req)
+		default:
+			if v, ok := r.handleStatus[interceptor.statusCode]; ok {
+				v.ServeHTTP(interceptor.ResponseWriter, req)
+			}
+		}
 	}
 }
 
@@ -280,9 +274,9 @@ func (r *Router) registerRoute(method, pattern string, handler http.HandlerFunc)
 	return
 }
 
-func (r *Router) registerDocs(method, pattern string, docs ...Docs) string {
+func (r *Router) registerDocs(method, pattern string, docs ...Docs) {
 	if len(docs) == 0 {
-		return ""
+		return
 	}
 
 	var (
@@ -293,6 +287,8 @@ func (r *Router) registerDocs(method, pattern string, docs ...Docs) string {
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()
 	defer rootRouter.mu.Unlock()
+
+	rootRouter.patternMap[stripPattern] = pattern
 
 	// Get or create RouteInfo for the pattern
 	pathItem, exists := rootRouter.openapi.Paths[pattern]
@@ -342,8 +338,6 @@ func (r *Router) registerDocs(method, pattern string, docs ...Docs) string {
 	}
 
 	rootRouter.openapi.Paths[stripPattern] = pathItem.SetMethod(method, op)
-
-	return stripPattern
 }
 
 func (r *Router) rootParent() *Router {
@@ -353,23 +347,14 @@ func (r *Router) rootParent() *Router {
 	return r.parent.rootParent()
 }
 
-func PrependIfMissing(slice []string, s string) []string {
-	for _, item := range slice {
-		if item == s {
-			return slice
-		}
+func addIfMissing[T comparable](slice []T, element T, prepend bool) []T {
+	if slices.Contains(slice, element) {
+		return slice
 	}
-
-	return append([]string{s}, slice...)
-}
-
-func appendIfMissing(slice []string, s string) []string {
-	for _, item := range slice {
-		if item == s {
-			return slice
-		}
+	if prepend {
+		return append([]T{element}, slice...)
 	}
-	return append(slice, s)
+	return append(slice, element)
 }
 
 func (r *Router) getMethodsForPattern(pattern string) []string {
@@ -380,28 +365,34 @@ func (r *Router) getMethodsForPattern(pattern string) []string {
 	var methods []string
 	if routeInfo, exists := rootRouter.openapi.Paths[pattern]; exists {
 		if routeInfo.Get != nil {
-			methods = appendIfMissing(methods, http.MethodGet)
+			methods = addIfMissing(methods, http.MethodGet, false)
 		}
 		if routeInfo.Post != nil {
-			methods = appendIfMissing(methods, http.MethodPost)
+			methods = addIfMissing(methods, http.MethodPost, false)
 		}
 		if routeInfo.Put != nil {
-			methods = appendIfMissing(methods, http.MethodPut)
+			methods = addIfMissing(methods, http.MethodPut, false)
 		}
 		if routeInfo.Delete != nil {
-			methods = appendIfMissing(methods, http.MethodDelete)
+			methods = addIfMissing(methods, http.MethodDelete, false)
 		}
 		if routeInfo.Patch != nil {
-			methods = appendIfMissing(methods, http.MethodPatch)
+			methods = addIfMissing(methods, http.MethodPatch, false)
 		}
 	}
 	return methods
 }
 
-func (r *Router) registerOptionsHandler(pattern string) {
+func (r *Router) registerOptionsHandler(strippedPattern string) {
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()
 	defer rootRouter.mu.Unlock()
+
+	// Get the original pattern
+	pattern, exists := rootRouter.patternMap[strippedPattern]
+	if !exists {
+		pattern = strippedPattern // Fallback to strippedPattern if mapping is missing
+	}
 
 	// Get methods for the pattern
 	routeInfo, exists := rootRouter.openapi.Paths[pattern]
@@ -410,7 +401,7 @@ func (r *Router) registerOptionsHandler(pattern string) {
 	}
 
 	// Create the OPTIONS handler with the Allow header
-	methods := PrependIfMissing(routeInfo.Methods(), http.MethodOptions)
+	methods := addIfMissing(routeInfo.Methods(), http.MethodOptions, true)
 	optionsHandler := func(w http.ResponseWriter, req *http.Request) {
 		w.Header().Set("Allow", strings.Join(methods, ", "))
 		w.WriteHeader(http.StatusNoContent)
@@ -447,69 +438,99 @@ func (r *Router) handleDocOut(do map[string]DocOut, schemas map[string]Schema) (
 	}
 
 	for responseCode, docOut := range do {
-		obj := reflect.ValueOf(docOut.Object)
-		if obj.Kind() == reflect.Ptr {
-			obj = obj.Elem()
-		}
+		var schema *Schema
+		if docOut.Object != nil {
+			obj := reflect.ValueOf(docOut.Object)
+			if obj.Kind() == reflect.Ptr {
+				obj = obj.Elem()
+			}
 
-		pType := "object"
-		name := obj.Type().Name()
-		schema := Schema{
-			Ref: fmt.Sprintf("#/components/schemas/%s", name),
-		}
+			pType := "object"
+			name := obj.Type().Name()
+			schema = &Schema{
+				Ref: fmt.Sprintf("#/components/schemas/%s", name),
+			}
 
-		if _, ok := schemas[name]; !ok {
-			if obj.Kind() == reflect.Slice {
-				pType = "array"
-				elementType := obj.Type().Elem()
-				obj = reflect.New(elementType).Elem()
-				name = obj.Type().Name()
-				schema = Schema{
-					Type: pType,
-					Items: &Schema{
-						Ref: fmt.Sprintf("#/components/schemas/%s", name),
-					},
+			if _, ok := schemas[name]; !ok {
+				if obj.Kind() == reflect.Slice {
+					pType = "array"
+					elementType := obj.Type().Elem()
+					obj = reflect.New(elementType).Elem()
+					name = obj.Type().Name()
+					schema = &Schema{
+						Type: pType,
+						Items: &Schema{
+							Ref: fmt.Sprintf("#/components/schemas/%s", name),
+						},
+					}
+				}
+
+				properties := make(map[string]Schema)
+
+				for i := 0; i < obj.NumField(); i++ {
+					fieldType := obj.Type().Field(i)
+					fieldName := fieldType.Name
+					jsonTag := fieldType.Tag.Get("json")
+					if jsonTag != "" && jsonTag != "-" {
+						fieldName = strings.Split(jsonTag, ",")[0]
+					}
+
+					fieldKind := fieldType.Type.Kind()
+					var typeName string
+					switch fieldKind {
+					case reflect.String:
+						typeName = "string"
+					case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+						typeName = "integer"
+					case reflect.Float32, reflect.Float64:
+						typeName = "number"
+					case reflect.Bool:
+						typeName = "boolean"
+					case reflect.Struct:
+						typeName = "object"
+					case reflect.Slice, reflect.Array:
+						typeName = "array"
+					default:
+						typeName = "string" // Default to string if unknown
+					}
+
+					properties[fieldName] = Schema{
+						Type: typeName,
+					}
+				}
+
+				if componentSchemas == nil {
+					componentSchemas = make(map[string]Schema)
+				}
+
+				componentSchemas[name] = Schema{
+					Type:       pType,
+					Properties: properties,
 				}
 			}
-
-			properties := make(map[string]Schema)
-
-			for i := 0; i < obj.NumField(); i++ {
-				field := obj.Field(i)
-				fieldName := obj.Type().Field(i).Name
-				fieldType := field.Type().Name()
-
-				properties[fieldName] = Schema{
-					Type: fieldType,
-				}
-			}
-
-			if componentSchemas == nil {
-				componentSchemas = make(map[string]Schema)
-			}
-
-			componentSchemas[name] = Schema{
-				Type:       pType,
-				Properties: properties,
-			}
+		} else {
+			// Handle nil docOut.Object by setting schema to nil
+			schema = nil
 		}
 
 		if routeResponse == nil {
 			routeResponse = make(map[string]Response)
 		}
 
+		mediaType := MediaType{}
+		if schema != nil {
+			mediaType.Schema = schema
+		}
+
 		routeResponse[responseCode] = Response{
 			Description: docOut.Description,
 			Content: map[string]MediaType{
-				docOut.ApplicationType: {
-					Schema: &schema,
-				},
+				docOut.ApplicationType: mediaType,
 			},
 		}
 	}
 
 	return componentSchemas, routeResponse
-
 }
 
 func (r *Router) handleDocIn(do map[string]DocIn, schemas map[string]Schema) (map[string]Schema, *RequestBody) {

@@ -15,6 +15,11 @@ type (
 		ID   string `json:"id"`
 		Name string `json:"name"`
 	}
+
+	Blog struct {
+		ID    string `json:"id"`
+		Title string `json:"title"`
+	}
 )
 
 func main() {
@@ -26,23 +31,55 @@ func main() {
 	r.UseOpenapiDocs(true)
 	// Apply global middleware
 	r.Use(middleware.Timer)
+	r.Use(middleware.Recover)
 
 	// Serve static files
 	r.ServeFiles("/file/", http.Dir("./files"))
 	r.ServeFile("/favicon.ico", "./files/favicon.ico")
 
-	// Set custom handlers
-	r.NotFound(notFoundHandler)
-	r.MethodNotAllowed(methodNotAllowedHandler)
+	// Set custom handlers from methods
+	r.HandleStatus(http.StatusNotFound, notFoundHandler)
+	r.HandleStatus(http.StatusMethodNotAllowed, methodNotAllowedHandler)
+
+	r.RedirectTrailingSlash(true)
+
+	// set custom handler inlining
+	r.HandleStatus(http.StatusInternalServerError, func(w http.ResponseWriter, req *http.Request) {
+		http.Error(w, "Custom 500 - Internal Server Error", http.StatusInternalServerError)
+	})
 
 	// Define routes
 	r.Get("/{$}", homeHandler, router.Docs{
 		Summary:     "Home Page",
 		Description: "Displays the home page.",
+		Out: map[string]router.DocOut{
+			"200": {
+				ApplicationType: "text/html",
+				Description:     "The home page.",
+			},
+		},
 	})
 	r.Get("/gopher", gopherHandler, router.Docs{
 		Summary:     "Gopher Page",
 		Description: "Displays a gopher image.",
+		Out: map[string]router.DocOut{
+			"200": {
+				ApplicationType: "text/html",
+				Description:     "The gopher image.",
+			},
+		},
+	})
+	r.Get("/panic", func(w http.ResponseWriter, req *http.Request) {
+		panic("Panic!")
+	}, router.Docs{
+		Summary:     "Panic Page",
+		Description: "Generates a panic.",
+		Out: map[string]router.DocOut{
+			"500": {
+				ApplicationType: "text/plain",
+				Description:     "Internal Server Error",
+			},
+		},
 	})
 	r.Post("/login", loginHandler)
 
@@ -91,6 +128,13 @@ func main() {
 					Object: User{},
 				},
 			},
+			Out: map[string]router.DocOut{
+				"200": {
+					ApplicationType: "application/json",
+					Description:     "The updated user object.",
+					Object:          User{},
+				},
+			},
 		})
 
 		r.Post("", func(w http.ResponseWriter, req *http.Request) {
@@ -98,6 +142,98 @@ func main() {
 		}, router.Docs{
 			Summary:     "Create User",
 			Description: "Creates a new user.",
+			In: map[string]router.DocIn{
+				"application/json": {
+					Object: User{},
+				},
+			},
+			Out: map[string]router.DocOut{
+				"201": {
+					ApplicationType: "application/json",
+					Description:     "The created user object.",
+					Object:          User{},
+				},
+			},
+		})
+	})
+
+	r.Group("/blog", func(r *router.Router) {
+		r.Get("", func(w http.ResponseWriter, req *http.Request) {
+			_, _ = fmt.Fprintln(w, "Blog List Page")
+		}, router.Docs{
+			Summary:     "Blog List",
+			Description: "Displays a list of blog posts.",
+			Out: map[string]router.DocOut{
+				"200": {
+					ApplicationType: "application/json",
+					Description:     "The list of blog posts.",
+					Object:          []Blog{},
+				},
+			},
+		})
+
+		r.Get("/{id}", func(w http.ResponseWriter, req *http.Request) {
+			blogID := req.PathValue("id")
+			_, _ = fmt.Fprintf(w, "Blog ID: %s", blogID)
+		}, router.Docs{
+			Summary:     "Get Blog",
+			Description: "Retrieves a blog post by ID.",
+			Parameters: []router.Parameter{
+				{
+					Name:        "id",
+					In:          "path",
+					Description: "The ID of the blog post.",
+					Schema: &router.Schema{
+						Type: "string",
+					},
+					Required: true,
+				},
+			},
+			Out: map[string]router.DocOut{
+				"200": {
+					ApplicationType: "application/json",
+					Description:     "The blog post object.",
+					Object:          Blog{},
+				},
+			},
+		})
+
+		r.Post("", func(w http.ResponseWriter, req *http.Request) {
+			_, _ = fmt.Fprintln(w, "Create Blog")
+		}, router.Docs{
+			Summary:     "Create Blog",
+			Description: "Creates a new blog post.",
+			In: map[string]router.DocIn{
+				"application/json": {
+					Object: Blog{},
+				},
+			},
+			Out: map[string]router.DocOut{
+				"201": {
+					ApplicationType: "application/json",
+					Description:     "The created blog post.",
+					Object:          Blog{},
+				},
+			},
+		})
+
+		r.Put("/{id}", func(w http.ResponseWriter, req *http.Request) {
+			_, _ = fmt.Fprintln(w, "Update Blog")
+		}, router.Docs{
+			Summary:     "Update Blog",
+			Description: "Updates an existing blog post.",
+			In: map[string]router.DocIn{
+				"application/json": {
+					Object: Blog{},
+				},
+			},
+			Out: map[string]router.DocOut{
+				"200": {
+					ApplicationType: "application/json",
+					Description:     "The updated blog post.",
+					Object:          Blog{},
+				},
+			},
 		})
 	})
 
@@ -114,6 +250,12 @@ func main() {
 	}, router.Docs{
 		Summary:     "OpenAPI Docs",
 		Description: "Displays the OpenAPI documentation.",
+		Out: map[string]router.DocOut{
+			"200": {
+				ApplicationType: "application/json",
+				Description:     "The OpenAPI documentation.",
+			},
+		},
 	})
 
 	// Start the server

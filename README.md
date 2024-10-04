@@ -3,10 +3,10 @@ go-router is a lightweight, flexible, and idiomatic HTTP router for Go web appli
 
 ## Overview
 
-- **Method-Based Routing**: Easily define routes for `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `OPTIONS`, and `HEAD` methods.
+- **Method-Based Routing**: Easily define routes for `GET`, `POST`, `PUT`, `PATCH` and `DELETE` methods.
 - **Route Grouping**: Organize routes under common base paths using groups.
 - **Middleware Support**: Apply middleware functions globally or per group.
-- **Custom 404, 405 and 500 Handlers**: Set custom handlers for NotFound (404) and MethodNotAllowed (405) responses.
+- **Custom Status Handlers**: Set custom handlers for any possible status code.
 - **Trailing Slash Handling**: Configure automatic redirection of trailing slashes.
 - **Static File Serving**: Serve static files and directories seamlessly.
 - **Built on Standard Library**: Utilizes Go's net/http package, ensuring performance and reliability.
@@ -60,16 +60,14 @@ Route Definition Methods
 Define routes for specific HTTP methods.
 
 - (*Router) Get(pattern string, handler http.HandlerFunc)
-- (*Router) Head(pattern string, handler http.HandlerFunc)
 - (*Router) Post(pattern string, handler http.HandlerFunc)
 - (*Router) Put(pattern string, handler http.HandlerFunc)
 - (*Router) Patch(pattern string, handler http.HandlerFunc)
 - (*Router) Delete(pattern string, handler http.HandlerFunc)
-- (*Router) Options(pattern string, handler http.HandlerFunc)v
 
 #### Parameters
 
-- **pattern string**: The URL pattern for the route. Patterns can include placeholders like {id}. A pattern that ends in “/” matches all paths that have it as a prefix, as always. To match the exact pattern including the trailing slash, end it with {$}, as in /exact/match/{$}.
+- **pattern string**: The URL pattern for the route. Patterns can include placeholders like {id}. A pattern that ends in “/” matches all paths that have it as a prefix, as always. To match the exact pattern including the trailing slash, end it with `{$}`, as in `/exact/match/{$}`.
 - **handler http.HandlerFunc**: The function to handle requests matching the pattern and method.
 
 ### Grouping Routes
@@ -95,8 +93,7 @@ Apply middleware functions to the router.
 
 ### Custom Handlers
 
-v(*Router) NotFound(handler http.HandlerFunc)**: Set a custom handler for 404 Not Found responses.
-- **(*Router) MethodNotAllowed(handler http.HandlerFunc)**: Set a custom handler for 405 Method Not Allowed responses.
+- **(*Router) HandleStatus(http.StatusCode, handler http.HandlerFunc)**: Set a custom handler for any status code.
 
 #### Parameters
 
@@ -182,14 +179,14 @@ admin.Get("/dashboard", adminDashboardHandler)
 })
 ```
 
-### Custom Handlers for 404 and 405 and 500 Responses
+### Custom Handlers for response
 
 Set custom handlers to provide consistent error responses.
 
 ```go
-r.NotFound(notFoundHandler)
-r.MethodNotAllowed(methodNotAllowedHandler)
-r.InternalServerError(internalServerErrorHandler)
+r.HandleStatus(http.StatusNotFound, notFoundHandler)
+r.HandleStatus(http.StatusMethodNotAllowed, methodNotAllowedHandler)
+r.HandleStatus(http.StatusInternalServerError,internalServerErrorHandler)
 ```
 
 ### Trailing Slash Handling
@@ -217,10 +214,9 @@ r.ServeFile("/favicon.ico", "./static/favicon.ico")
 
 - **Pattern Matching**: Patterns not ending with a slash (/) are treated as exact matches, while patterns ending with a slash are treated as prefix matches.
 - **Middleware Order**: Middleware functions are applied in the order they are added, wrapping subsequent middleware and the final handler.
-- **Custom 404 and 405 Handling**: The router uses intercepting response writers to capture 404 and 405 responses from the underlying http.ServeMux and invoke custom handlers.
+- **Custom Status Handling**: The router uses intercepting response writers to capture status code responses from the underlying http.ServeMux and invoke custom handlers.
 - **Trailing Slash Redirection**: When enabled, requests with trailing slashes are redirected to the same path without the trailing slash.
 
 ## Future Improvements
 
-- **Automatic OPTIONS Handling**: Provide automatic handling of OPTIONS requests.
 - **Error Handling Enhancements**: Provide mechanisms for handling other HTTP status codes.
