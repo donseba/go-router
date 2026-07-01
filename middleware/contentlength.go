@@ -9,26 +9,22 @@ import (
 // ContentLengthMiddleware automatically sets the Content-Length header
 func ContentLengthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Wrap the ResponseWriter
 		clw := &contentLengthWriter{
 			ResponseWriter: w,
 			buffer:         &bytes.Buffer{},
+			statusCode:     http.StatusOK,
 		}
 
-		// Call the next handler with the wrapped ResponseWriter
 		next.ServeHTTP(clw, r)
 
-		// Set the Content-Length header
-		contentLength := clw.buffer.Len()
-		if clw.Header().Get("Content-Length") == "" {
-			clw.Header().Set("Content-Length", strconv.Itoa(contentLength))
+		if shouldSetContentLength(r.Method, clw.statusCode) && clw.Header().Get("Content-Length") == "" {
+			clw.Header().Set("Content-Length", strconv.Itoa(clw.buffer.Len()))
 		}
 
-		// Write the buffered content to the original ResponseWriter
-		if !clw.wroteHeader {
-			clw.WriteHeader(clw.statusCode)
+		w.WriteHeader(clw.statusCode)
+		if r.Method != http.MethodHead && clw.statusCode != http.StatusNoContent && clw.statusCode != http.StatusNotModified {
+			_, _ = w.Write(clw.buffer.Bytes())
 		}
-		w.Write(clw.buffer.Bytes())
 	})
 }
 
@@ -43,10 +39,21 @@ func (clw *contentLengthWriter) WriteHeader(statusCode int) {
 	if !clw.wroteHeader {
 		clw.statusCode = statusCode
 		clw.wroteHeader = true
-		clw.ResponseWriter.WriteHeader(statusCode)
 	}
 }
 
 func (clw *contentLengthWriter) Write(data []byte) (int, error) {
 	return clw.buffer.Write(data)
+}
+
+func (clw *contentLengthWriter) Unwrap() http.ResponseWriter {
+	return clw.ResponseWriter
+}
+
+func shouldSetContentLength(method string, statusCode int) bool {
+	if method == http.MethodHead {
+		return true
+	}
+
+	return statusCode != http.StatusNotModified
 }
