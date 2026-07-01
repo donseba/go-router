@@ -1,222 +1,563 @@
-# go-router Documentation
-go-router is a lightweight, flexible, and idiomatic HTTP router for Go web applications. It leverages Go's standard `net/http` package and the latest routing enhancements in Go 1.22 to provide powerful routing capabilities without external dependencies.
+<p align="center">
+    <img src="./assets/go-router-logo.png" alt="go-doc" width="420">
+</p>
 
-## Overview
+`go-router` is a lightweight router for Go websites and APIs. It builds on the standard library `net/http` `ServeMux` and adds the pieces most small and medium applications usually end up needing: route groups, middleware, named routes, host and subdomain routing, mounted routers, OpenAPI helpers, route walking, static files, and practical middleware.
 
-- **Method-Based Routing**: Easily define routes for `GET`, `POST`, `PUT`, `PATCH` and `DELETE` methods.
-- **Route Grouping**: Organize routes under common base paths using groups.
-- **Middleware Support**: Apply middleware functions globally or per group.
-- **Custom Status Handlers**: Set custom handlers for any possible status code.
-- **Trailing Slash Handling**: Configure automatic redirection of trailing slashes.
-- **Static File Serving**: Serve static files and directories seamlessly.
-- **Built on Standard Library**: Utilizes Go's net/http package, ensuring performance and reliability.
-- **No External Dependencies**: Keeps your application lightweight and maintainable.
+It is designed for applications that want to stay close to `net/http` without giving up website/API ergonomics.
 
-## Installation
+## Features
 
-Ensure you have Go 1.22 or later installed to leverage the latest routing enhancements.
+- Standard-library based routing with Go's method-aware `ServeMux` patterns.
+- Route groups and middleware-only groups.
+- Exact host, subdomain, and wildcard subdomain routing.
+- Named routes with reverse path and URL generation.
+- Mounted routers with named route, route walk, and OpenAPI metadata propagation.
+- Route walking and route table diagnostics.
+- Static file and single-file serving.
+- Custom status handlers.
+- Optional trailing slash redirects.
+- OpenAPI metadata and schema helpers.
+- JSON request/response helpers.
+- Path parameter helper functions.
+- Bundled middleware for request IDs, logging, recovery, timeouts, security headers, CORS, real IP, content length, and timing.
+- Registration freezes after the first request to avoid runtime mutation races.
 
-To install go-router, run:
+## Install
 
 ```bash
 go get github.com/donseba/go-router
 ```
----
-## Package Contents
 
-### Types
+`go-router` targets modern Go and uses the standard library routing improvements introduced in Go 1.22.
 
-#### Router
-
-The `Router` struct is the core of the package, providing methods to define routes, apply middleware, and configure routing behavior.
-Fields
-
-- **mux *http.ServeMux**: The underlying HTTP request multiplexer.
-- **basePath string**: The base path for the router, used in route grouping.
-- **redirectTrailingSlash bool**: Determines whether to redirect trailing slashes to their non-trailing counterparts.
-- **middlewares []Middleware**: A slice of middleware functions applied to the router.
-- **notFoundHandler http.HandlerFunc**: Custom handler for 404 Not Found responses.
-- **methodNotAllowedHandler http.HandlerFunc**: Custom handler for 405 Method Not Allowed responses.
-
-#### Middleware
-
-`type Middleware func(http.Handler) http.Handler`
-
-Represents a middleware function that wraps an http.Handler to perform actions before or after the handler executes.
-
-### Functions
-
-#### New(ht *http.ServeMux) *Router
-
-Creates a new Router instance using the provided http.ServeMux.
-
-#### NewDefault() *Router
-
-Creates a new Router instance with a default http.ServeMux.
-
-### Methods
-Route Definition Methods
-
-Define routes for specific HTTP methods.
-
-- (*Router) Get(pattern string, handler http.HandlerFunc)
-- (*Router) Post(pattern string, handler http.HandlerFunc)
-- (*Router) Put(pattern string, handler http.HandlerFunc)
-- (*Router) Patch(pattern string, handler http.HandlerFunc)
-- (*Router) Delete(pattern string, handler http.HandlerFunc)
-
-#### Parameters
-
-- **pattern string**: The URL pattern for the route. Patterns can include placeholders like {id}. A pattern that ends in “/” matches all paths that have it as a prefix, as always. To match the exact pattern including the trailing slash, end it with `{$}`, as in `/exact/match/{$}`.
-- **handler http.HandlerFunc**: The function to handle requests matching the pattern and method.
-
-### Grouping Routes
-
-`(*Router) Group(basePath string, fn func(*Router))`
-
-Organize routes under a common base path.
-
-####  Parameters
-
-- **basePath string**: The base path for the group.
-- **fn func(*Router)**: A function that receives a sub-router for defining grouped routes.
-
-### Middleware
-
-`(*Router) Use(middleware Middleware)`
-
-Apply middleware functions to the router.
-
-#### Parameters
-
-- **middleware Middleware**: A middleware function to be applied.
-
-### Custom Handlers
-
-- **(*Router) HandleStatus(http.StatusCode, handler http.HandlerFunc)**: Set a custom handler for any status code.
-
-#### Parameters
-
-    handler http.HandlerFunc: The function to handle the specific response.
-
-### Trailing Slash Handling
-
-`(*Router) RedirectTrailingSlash(redirect bool)`
-
-Configure automatic redirection of trailing slashes.
-#### Parameters
-
-- **redirect bool**: If true, requests with trailing slashes are redirected to their non-trailing counterparts.
-
-### Serving Static Files
-
-- **(*Router) ServeFiles(pattern string, fs http.FileSystem)**: Serve static files from a directory.
-- **(*Router) ServeFile(pattern string, filepath string)**: Serve a single static file.
-
-#### Parameters
-
-- **pattern string**: The URL pattern under which the files are served.
-- **fs http.FileSystem**: The file system to serve files from.
-- **filepath string**: The path to the file to be served.
-
-### HTTP Handling
-
-`(*Router) ServeHTTP(w http.ResponseWriter, req *http.Request)`
-
-Implements the http.Handler interface, allowing the router to serve HTTP requests.
-
-### Internal Methods
-`handle(method, pattern string, handler http.HandlerFunc)`
-
-An internal method used to register handlers for specific HTTP methods and patterns.
-#### Parameters
-
-- **method string**: The HTTP method (e.g., GET, POST).
-- **pattern string**: The URL pattern.
-- **handler http.HandlerFunc**: The handler function.
-
---- 
-
-## Configuration Variables
-
-- **DefaultRedirectTrailingSlash bool**: The default setting for trailing slash redirection (default is true).
-
---- 
-## Usage Guidelines
-
-### Defining Routes
-
-Use the provided methods to define routes for specific HTTP methods. Patterns can include placeholders for path parameters.
+## Quick Start
 
 ```go
-r.Get("/users/{id}", userHandler)
+package main
+
+import (
+    "fmt"
+    "log"
+    "net/http"
+    "time"
+
+    "github.com/donseba/go-router"
+    "github.com/donseba/go-router/middleware"
+)
+
+func main() {
+    r := router.New(http.NewServeMux(), "Example API", "1.0.0")
+
+    r.Use(middleware.RequestID)
+    r.Use(middleware.Logger())
+    r.Use(middleware.Recover)
+    r.Use(middleware.Timeout(10 * time.Second))
+
+    r.Get("/", func(w http.ResponseWriter, req *http.Request) {
+        _, _ = fmt.Fprintln(w, "hello")
+    }).As("home")
+
+    r.Get("/users/{id}", func(w http.ResponseWriter, req *http.Request) {
+        id, err := router.IntParam(req, "id")
+        if err != nil {
+            _ = router.BadRequest(w, err)
+            return
+        }
+
+        _ = router.JSON(w, http.StatusOK, map[string]any{
+            "id": id,
+        })
+    }).As("users.show")
+
+    log.Fatal(http.ListenAndServe(":8080", r))
+}
 ```
 
-### Grouping Routes
+## Routing
 
-Group related routes under a common base path using the Group method.
+Routes are registered by HTTP method:
 
 ```go
-r.Group("/api", func(api *Router) {
-   api.Get("/users", apiUsersHandler)
-   api.Post("/users", apiCreateUserHandler)
+r.Get("/users", listUsers)
+r.Post("/users", createUser)
+r.Get("/users/{id}", showUser)
+r.Put("/users/{id}", updateUser)
+r.Patch("/users/{id}", patchUser)
+r.Delete("/users/{id}", deleteUser)
+r.Head("/health", healthHead)
+r.Options("/health", healthOptions)
+```
+
+Route patterns use the standard `http.ServeMux` syntax:
+
+```go
+r.Get("/users/{id}", handler)
+r.Get("/exact/{$}", handler)
+r.Get("/assets/", handler)
+```
+
+Inside handlers, use standard `req.PathValue` or the small helper functions:
+
+```go
+id := req.PathValue("id")
+
+intID, err := router.IntParam(req, "id")
+```
+
+Available helpers:
+
+- `Param`
+- `IntParam`
+- `Int64Param`
+- `BoolParam`
+- `Float64Param`
+
+## Error-Returning Registration
+
+The normal registration API panics on duplicate routes or invalid late registration. That is useful during startup because mistakes fail loudly.
+
+For apps that prefer explicit errors, use the `Try` variants:
+
+```go
+route, err := r.TryGet("/users/{id}", showUser)
+if err != nil {
+    return err
+}
+
+if err := route.TryAs("users.show"); err != nil {
+    return err
+}
+```
+
+Available `Try` methods:
+
+- `TryGet`, `TryHead`, `TryPost`, `TryPut`, `TryPatch`, `TryDelete`, `TryOptions`
+- `TryHandle`, `TryHandleFunc`
+- `TryMount`
+- `TryAs`
+
+## Groups
+
+Use `Group` to share a path prefix:
+
+```go
+r.Group("/api", func(api *router.Router) {
+    api.Get("/users", listUsers)
+    api.Post("/users", createUser)
 })
 ```
 
-### Applying Middleware
-
-Apply middleware functions globally or to specific route groups.
+Middleware added inside a group only applies to routes registered through that group:
 
 ```go
-
-// Global middleware
-r.Use(loggingMiddleware)
-
-// Middleware for a group
-r.Group("/admin", func(admin *Router) {
-admin.Use(authMiddleware)
-admin.Get("/dashboard", adminDashboardHandler)
+r.Group("/admin", func(admin *router.Router) {
+    admin.Use(adminOnly)
+    admin.Get("/dashboard", dashboard)
 })
 ```
 
-### Custom Handlers for response
-
-Set custom handlers to provide consistent error responses.
+Use `With` for middleware-only groups:
 
 ```go
-r.HandleStatus(http.StatusNotFound, notFoundHandler)
-r.HandleStatus(http.StatusMethodNotAllowed, methodNotAllowedHandler)
-r.HandleStatus(http.StatusInternalServerError,internalServerErrorHandler)
+r.With(func(private *router.Router) {
+    private.Use(requireLogin)
+    private.Get("/account", account)
+})
 ```
 
-### Trailing Slash Handling
-
-Configure the router to automatically redirect trailing slashes.
+Group-level OpenAPI metadata is inherited by child routes:
 
 ```go
-r.RedirectTrailingSlash(true) // Enabled by default
+r.Group("/api", func(api *router.Router) {
+    api.UseDocs(router.Docs{
+        Tags: []string{"api"},
+    })
+
+    api.Get("/users", listUsers, router.Docs{
+        Summary: "List users",
+    })
+})
 ```
-### Serving Static Files
 
-Serve files from a directory or serve a single file.
+## Host and Subdomain Routing
+
+Scope routes to an exact host:
 
 ```go
-// Serve files from the "./static" directory under "/static/"
-fs := http.Dir("./static")
-r.ServeFiles("/static/", fs)
+r.Host("admin.example.com", func(admin *router.Router) {
+    admin.Get("/", adminHome)
+})
+```
 
-// Serve a single file
+Use `Subdomain` for named subdomains:
+
+```go
+r.Subdomain("app", "example.com", func(app *router.Router) {
+    app.Get("/", appHome)
+})
+```
+
+Use `Subdomain("*", ...)` for wildcard subdomains:
+
+```go
+r.Subdomain("*", "example.com", func(tenant *router.Router) {
+    tenant.Get("/dashboard", tenantDashboard).As("tenant.dashboard")
+})
+```
+
+Exact hosts take precedence over wildcard hosts. The apex domain does not match a wildcard subdomain. Unknown hosts fall back to the default router.
+
+## Named Routes and URLs
+
+Name a route with `As`:
+
+```go
+r.Get("/users/{id}", showUser).As("users.show")
+```
+
+Generate paths:
+
+```go
+path := r.RoutePathWithParams("users.show", map[string]any{
+    "id": 123,
+})
+// "/users/123"
+```
+
+Parameter values are URL-escaped:
+
+```go
+r.RoutePathWithParams("files.show", map[string]any{
+    "name": "hello world/a",
+})
+// "/files/hello%20world%2Fa"
+```
+
+Host routes can generate full URLs:
+
+```go
+r.Host("admin.example.com", func(admin *router.Router) {
+    admin.Get("/users/{id}", showUser).As("admin.users.show")
+})
+
+r.RouteURL("admin.users.show", map[string]any{"id": 123}, "https")
+// "https://admin.example.com/users/123"
+```
+
+Wildcard subdomain URLs use a `subdomain` or `tenant` parameter:
+
+```go
+r.RouteURL("tenant.dashboard", map[string]any{
+    "subdomain": "acme",
+}, "https")
+// "https://acme.example.com/dashboard"
+```
+
+Template helpers are available through `FuncMap`:
+
+```go
+tmpl := template.New("page").Funcs(r.FuncMap())
+```
+
+Included template functions:
+
+- `routePath`
+- `routePathWithParams`
+- `routeHost`
+- `routeURL`
+- `isActiveRoute`
+- `isActiveRouteExact`
+- `isActiveRouteContains`
+
+## Mounting
+
+Mount any `http.Handler` under a path:
+
+```go
+r.Mount("/debug", http.DefaultServeMux)
+```
+
+Mounted `*router.Router` instances also contribute named routes, walk metadata, and OpenAPI paths/components:
+
+```go
+api := router.New(http.NewServeMux(), "API", "1.0.0")
+api.Get("/users/{id}", showUser).As("api.users.show")
+
+r.Mount("/api", api)
+
+r.RoutePathWithParams("api.users.show", map[string]any{"id": 123})
+// "/api/users/123"
+```
+
+## Middleware
+
+Middleware uses the standard shape:
+
+```go
+type Middleware func(http.Handler) http.Handler
+```
+
+Register middleware globally:
+
+```go
+r.Use(middleware.RequestID)
+r.Use(middleware.Logger())
+r.Use(middleware.Recover)
+```
+
+The bundled middleware package includes:
+
+- `RequestID`
+- `Logger`
+- `Recover`
+- `Timeout`
+- `RealIP`
+- `RealIPWithOptions`
+- `SecurityHeaders`
+- `CORS`
+- `ContentLengthMiddleware`
+- `Timer`
+
+For production proxy deployments, prefer `RealIPWithOptions`:
+
+```go
+r.Use(middleware.RealIPWithOptions(middleware.RealIPOptions{
+    TrustedProxies: []string{"127.0.0.1/32", "::1/128"},
+}))
+```
+
+`RealIP` trusts forwarding headers from any client and is mainly a convenience helper.
+
+`CORS` enforces configured preflight methods and headers:
+
+```go
+r.Use(middleware.CORS(middleware.CORSOptions{
+    AllowedOrigins: []string{"https://example.com"},
+    AllowedMethods: []string{"GET", "POST", "OPTIONS"},
+    AllowedHeaders: []string{"Content-Type", "Authorization"},
+}))
+```
+
+Avoid `ContentLengthMiddleware` for streaming, SSE, websockets, or reverse proxy style handlers because it buffers the response.
+
+## JSON Helpers
+
+For small JSON APIs:
+
+```go
+type CreateUser struct {
+    Name string `json:"name"`
+}
+
+func createUser(w http.ResponseWriter, req *http.Request) {
+    var input CreateUser
+    if err := router.DecodeJSON(req, &input); err != nil {
+        _ = router.BadRequest(w, err)
+        return
+    }
+
+    _ = router.JSON(w, http.StatusCreated, input)
+}
+```
+
+Helpers:
+
+- `DecodeJSON`
+- `JSON`
+- `Error`
+- `BadRequest`
+- `InternalServerError`
+- `MessageError`
+
+## Static Files
+
+Serve a directory:
+
+```go
+r.ServeFiles("/static/", http.Dir("./static"))
+```
+
+Serve one file:
+
+```go
 r.ServeFile("/favicon.ico", "./static/favicon.ico")
 ```
---- 
 
-## Important Notes
+Static files work inside groups and host routers:
 
-- **Pattern Matching**: Patterns not ending with a slash (/) are treated as exact matches, while patterns ending with a slash are treated as prefix matches.
-- **Middleware Order**: Middleware functions are applied in the order they are added, wrapping subsequent middleware and the final handler.
-- **Custom Status Handling**: The router uses intercepting response writers to capture status code responses from the underlying http.ServeMux and invoke custom handlers.
-- **Trailing Slash Redirection**: When enabled, requests with trailing slashes are redirected to the same path without the trailing slash.
+```go
+r.Host("cdn.example.com", func(cdn *router.Router) {
+    cdn.ServeFiles("/assets", http.Dir("./assets"))
+})
+```
 
-## Future Improvements
+## Custom Status Handlers
 
-- **Error Handling Enhancements**: Provide mechanisms for handling other HTTP status codes.
+Register custom handlers for status codes emitted by the underlying router:
+
+```go
+r.HandleStatus(http.StatusNotFound, notFound)
+r.HandleStatus(http.StatusMethodNotAllowed, methodNotAllowed)
+```
+
+Custom status handling uses an intercepting response writer. The no-custom-status path is optimized and allocation-free in the router benchmark.
+
+## Trailing Slashes
+
+Trailing slash redirects are off by default:
+
+```go
+r.RedirectTrailingSlash(true)
+```
+
+Groups and hosts can set their own trailing slash policy:
+
+```go
+r.Group("/admin", func(admin *router.Router) {
+    admin.RedirectTrailingSlash(true)
+})
+```
+
+## Route Walking and Diagnostics
+
+Use `Walk` to inspect registered routes:
+
+```go
+err := r.Walk(func(route router.RouteInfo) error {
+    log.Printf("%s %s %s %s", route.Host, route.Method, route.Path, route.Name)
+    log.Printf("handler: %T middleware: %d", route.Handler, len(route.Middlewares))
+    return nil
+})
+```
+
+Or print a route table:
+
+```go
+fmt.Print(r.RouteTable())
+```
+
+Duplicate route names and duplicate method/path/host registrations fail during registration.
+
+## OpenAPI
+
+Enable OpenAPI docs:
+
+```go
+r.UseOpenapiDocs(true)
+```
+
+Attach docs to routes:
+
+```go
+r.Get("/users/{id}", showUser, router.Docs{
+    Tags:    []string{"users"},
+    Summary: "Show user",
+    Out: map[string]router.DocOut{
+        "200": {
+            ApplicationType: "application/json",
+            Description:     "OK",
+            Object:          User{},
+        },
+    },
+})
+```
+
+Access the document:
+
+```go
+doc := r.OpenAPI()
+```
+
+Supported methods:
+
+- `GET`
+- `HEAD`
+- `POST`
+- `PUT`
+- `PATCH`
+- `DELETE`
+- `OPTIONS`
+
+Schema generation supports:
+
+- JSON field names and ignored fields
+- nested structs
+- embedded structs
+- slices and arrays
+- maps via `additionalProperties`
+- pointers as nullable
+- `time.Time` as `date-time`
+- `format` tags
+- `enum` tags such as `enum:"admin|user"`
+- required fields from `validate:"required"`, `binding:"required"`, or `required:"true"`
+
+OpenAPI support is useful, but still intentionally lightweight. For highly detailed API specs, you may still want explicit docs or schema overrides in your application.
+
+## Production Notes
+
+The router is intended to be configured during startup. After the first request is served, registration freezes and later mutation panics or returns an error through the `Try` APIs.
+
+Recommended production defaults:
+
+```go
+r.Use(middleware.RequestID)
+r.Use(middleware.RealIPWithOptions(middleware.RealIPOptions{
+    TrustedProxies: []string{"127.0.0.1/32", "::1/128"},
+}))
+r.Use(middleware.Logger())
+r.Use(middleware.Recover)
+r.Use(middleware.Timeout(10 * time.Second))
+r.Use(middleware.SecurityHeaders())
+```
+
+Before shipping an app:
+
+- Register routes only during startup.
+- Prefer `Try*` registration if you want explicit bootstrap errors.
+- Use `RealIPWithOptions` behind proxies.
+- Avoid response buffering middleware for streaming.
+- Run `go test ./...`, `go test -race ./...`, and `go vet ./...`.
+- Add app-level tests for mounted routers, subdomains, and custom middleware.
+
+See [PRODUCTION.md](PRODUCTION.md) for the current hardening checklist.
+
+## Benchmarks
+
+The router has a direct benchmark against raw `http.ServeMux` using the same route set and a minimal response writer.
+
+Recent local result:
+
+```text
+BenchmarkRouterVsServeMuxRouter  280271 ns/op   0 B/op   0 allocs/op
+BenchmarkRouterVsServeMuxStdlib  260223 ns/op   0 B/op   0 allocs/op
+```
+
+In that benchmark each operation serves 2000 requests, so the hot path is roughly:
+
+```text
+go-router: ~140 ns/request
+ServeMux:  ~130 ns/request
+```
+
+Benchmark numbers vary by machine. Run them locally with:
+
+```bash
+go test -run ^$ -bench . -benchmem
+```
+
+## Examples
+
+- `example/simple`
+- `example/openapi`
+- `example/production`
+
+## Status
+
+This project is suitable for controlled production use in your own applications, especially websites, internal tools, SaaS-style apps, and APIs where you own the route patterns and rollout.
+
+It is not yet as battle-tested as mature routers like `chi`. If you use it broadly, keep tests close to your app, run race tests, and harden based on real production behavior.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

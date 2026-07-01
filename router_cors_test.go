@@ -221,3 +221,63 @@ func TestCORSMiddleware(t *testing.T) {
 		})
 	}
 }
+
+func TestCORSMiddlewareRejectsDisallowedPreflightMethod(t *testing.T) {
+	handler := middleware.CORS(middleware.CORSOptions{
+		AllowedOrigins: []string{"https://example.com"},
+		AllowedMethods: []string{"GET"},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden preflight, got %d", w.Code)
+	}
+}
+
+func TestCORSMiddlewareRejectsDisallowedPreflightHeaders(t *testing.T) {
+	handler := middleware.CORS(middleware.CORSOptions{
+		AllowedOrigins: []string{"https://example.com"},
+		AllowedMethods: []string{"GET"},
+		AllowedHeaders: []string{"Content-Type"},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	req := httptest.NewRequest(http.MethodOptions, "/test", nil)
+	req.Header.Set("Origin", "https://example.com")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+	req.Header.Set("Access-Control-Request-Headers", "Authorization")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected forbidden preflight, got %d", w.Code)
+	}
+}
+
+func TestCORSMiddlewareCredentialedWildcardEchoesValidOrigin(t *testing.T) {
+	handler := middleware.CORS(middleware.CORSOptions{
+		AllowedOrigins:   []string{"*"},
+		AllowCredentials: true,
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Origin", "https://example.com")
+	w := httptest.NewRecorder()
+
+	handler.ServeHTTP(w, req)
+
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "https://example.com" {
+		t.Fatalf("expected origin echo, got %q", got)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Fatalf("expected credentials header, got %q", got)
+	}
+}

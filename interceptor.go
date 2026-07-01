@@ -20,12 +20,16 @@ func (w *excludeHeaderWriter) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
+func (w *excludeHeaderWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 type routingStatusInterceptWriter struct {
 	http.ResponseWriter
 
-	interceptMap map[int]func() bool
-	statusCode   int
-	intercepted  bool
+	statusHandlers map[int]http.HandlerFunc
+	statusCode     int
+	intercepted    bool
 }
 
 func (w *routingStatusInterceptWriter) WriteHeader(statusCode int) {
@@ -34,15 +38,9 @@ func (w *routingStatusInterceptWriter) WriteHeader(statusCode int) {
 	}
 
 	w.statusCode = statusCode
-	for code, fn := range w.interceptMap {
-		if w.intercepted {
-			return
-		}
-
-		if code == statusCode && fn() {
-			w.intercepted = true
-			return
-		}
+	if handler := w.statusHandlers[statusCode]; handler != nil && w.Header().Get(HeaderFlagDoNotIntercept) == "" {
+		w.intercepted = true
+		return
 	}
 
 	w.ResponseWriter.WriteHeader(statusCode)
@@ -54,4 +52,8 @@ func (w *routingStatusInterceptWriter) Write(data []byte) (int, error) {
 	}
 
 	return w.ResponseWriter.Write(data)
+}
+
+func (w *routingStatusInterceptWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }

@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -36,15 +37,23 @@ func CORS(options CORSOptions) func(http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 			origin := req.Header.Get("Origin")
 			if origin == "" {
-				// Not a CORS request
 				next.ServeHTTP(w, req)
 				return
 			}
 
-			// Check if origin is allowed
+			w.Header().Add("Vary", "Origin")
+
 			var allowedOrigin string
 			if allowAllOrigins {
-				allowedOrigin = "*"
+				if options.AllowCredentials {
+					if !isValidOrigin(origin) {
+						w.WriteHeader(http.StatusForbidden)
+						return
+					}
+					allowedOrigin = origin
+				} else {
+					allowedOrigin = "*"
+				}
 			} else {
 				for _, o := range allowedOrigins {
 					if o == origin {
@@ -53,23 +62,33 @@ func CORS(options CORSOptions) func(http.Handler) http.Handler {
 					}
 				}
 				if allowedOrigin == "" {
-					// Check wildcard origins
 					for _, wo := range wildcardOrigins {
-						if strings.HasSuffix(origin, wo) {
+						if originMatchesWildcard(origin, wo) {
 							allowedOrigin = origin
 							break
 						}
 					}
 				}
 				if allowedOrigin == "" {
-					// Origin not allowed
 					w.WriteHeader(http.StatusForbidden)
 					return
 				}
 			}
 
 			if req.Method == http.MethodOptions {
-				// Preflight request
+				w.Header().Add("Vary", "Access-Control-Request-Method")
+				w.Header().Add("Vary", "Access-Control-Request-Headers")
+				reqMethod := req.Header.Get("Access-Control-Request-Method")
+				if reqMethod != "" && len(options.AllowedMethods) > 0 && !containsToken(options.AllowedMethods, reqMethod) {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				reqHeaders := headerTokens(req.Header.Get("Access-Control-Request-Headers"))
+				if len(reqHeaders) > 0 && len(options.AllowedHeaders) > 0 && !containsAllTokens(options.AllowedHeaders, reqHeaders) {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+
 				w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 				if options.AllowCredentials {
 					w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -77,17 +96,15 @@ func CORS(options CORSOptions) func(http.Handler) http.Handler {
 				if len(options.AllowedMethods) > 0 {
 					w.Header().Set("Access-Control-Allow-Methods", strings.Join(options.AllowedMethods, ", "))
 				} else {
-					// Use the method from the request header
-					if reqMethod := req.Header.Get("Access-Control-Request-Method"); reqMethod != "" {
+					if reqMethod != "" {
 						w.Header().Set("Access-Control-Allow-Methods", reqMethod)
 					}
 				}
 				if len(options.AllowedHeaders) > 0 {
 					w.Header().Set("Access-Control-Allow-Headers", strings.Join(options.AllowedHeaders, ", "))
 				} else {
-					// Use the headers from the request header
-					if reqHeaders := req.Header.Get("Access-Control-Request-Headers"); reqHeaders != "" {
-						w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+					if len(reqHeaders) > 0 {
+						w.Header().Set("Access-Control-Allow-Headers", strings.Join(reqHeaders, ", "))
 					}
 				}
 				if options.MaxAge > 0 {
@@ -95,18 +112,73 @@ func CORS(options CORSOptions) func(http.Handler) http.Handler {
 				}
 				w.WriteHeader(http.StatusNoContent)
 				return
-			} else {
-				// Actual request
-				w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-				if options.AllowCredentials {
-					w.Header().Set("Access-Control-Allow-Credentials", "true")
-				}
-				if len(options.ExposedHeaders) > 0 {
-					w.Header().Set("Access-Control-Expose-Headers", strings.Join(options.ExposedHeaders, ", "))
-				}
-				// Proceed to the next handler
-				next.ServeHTTP(w, req)
 			}
+
+			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+			if options.AllowCredentials {
+				w.Header().Set("Access-Control-Allow-Credentials", "true")
+			}
+			if len(options.ExposedHeaders) > 0 {
+				w.Header().Set("Access-Control-Expose-Headers", strings.Join(options.ExposedHeaders, ", "))
+			}
+			next.ServeHTTP(w, req)
 		})
 	}
+}
+
+func originMatchesWildcard(origin string, wildcardSuffix string) bool {
+	originURL, err := url.Parse(origin)
+	if err != nil || originURL.Hostname() == "" {
+		return false
+	}
+
+	suffix := strings.TrimPrefix(wildcardSuffix, ".")
+	host := strings.ToLower(originURL.Hostname())
+	return host != suffix && strings.HasSuffix(host, "."+suffix)
+}
+
+func isValidOrigin(origin string) bool {
+	if origin == "null" {
+		return true
+	}
+
+	originURL, err := url.Parse(origin)
+	return err == nil && originURL.Scheme != "" && originURL.Hostname() != ""
+}
+
+func containsToken(tokens []string, value string) bool {
+	for _, token := range tokens {
+		if strings.EqualFold(strings.TrimSpace(token), strings.TrimSpace(value)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func containsAllTokens(allowed []string, requested []string) bool {
+	for _, value := range requested {
+		if !containsToken(allowed, value) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func headerTokens(header string) []string {
+	if header == "" {
+		return nil
+	}
+
+	parts := strings.Split(header, ",")
+	tokens := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			tokens = append(tokens, part)
+		}
+	}
+
+	return tokens
 }

@@ -29,17 +29,22 @@ type Server struct {
 
 // PathItem describes the operations available on a single path.
 type PathItem struct {
-	Get    *Operation `json:"get,omitempty"`    // GET operation
-	Post   *Operation `json:"post,omitempty"`   // POST operation
-	Put    *Operation `json:"put,omitempty"`    // PUT operation
-	Delete *Operation `json:"delete,omitempty"` // DELETE operation
-	Patch  *Operation `json:"patch,omitempty"`  // PATCH operation
+	Get     *Operation `json:"get,omitempty"`     // GET operation
+	Head    *Operation `json:"head,omitempty"`    // HEAD operation
+	Post    *Operation `json:"post,omitempty"`    // POST operation
+	Put     *Operation `json:"put,omitempty"`     // PUT operation
+	Delete  *Operation `json:"delete,omitempty"`  // DELETE operation
+	Patch   *Operation `json:"patch,omitempty"`   // PATCH operation
+	Options *Operation `json:"options,omitempty"` // OPTIONS operation
 }
 
 func (p PathItem) Methods() []string {
 	var methods []string
 	if p.Get != nil {
 		methods = append(methods, "GET")
+	}
+	if p.Head != nil {
+		methods = append(methods, "HEAD")
 	}
 	if p.Post != nil {
 		methods = append(methods, "POST")
@@ -53,6 +58,9 @@ func (p PathItem) Methods() []string {
 	if p.Patch != nil {
 		methods = append(methods, "PATCH")
 	}
+	if p.Options != nil {
+		methods = append(methods, "OPTIONS")
+	}
 	return methods
 }
 
@@ -60,6 +68,8 @@ func (p PathItem) SetMethod(method string, operation *Operation) PathItem {
 	switch method {
 	case http.MethodGet:
 		p.Get = operation
+	case http.MethodHead:
+		p.Head = operation
 	case http.MethodPost:
 		p.Post = operation
 	case http.MethodPut:
@@ -68,6 +78,8 @@ func (p PathItem) SetMethod(method string, operation *Operation) PathItem {
 		p.Delete = operation
 	case http.MethodPatch:
 		p.Patch = operation
+	case http.MethodOptions:
+		p.Options = operation
 	}
 
 	return p
@@ -114,12 +126,15 @@ type MediaType struct {
 
 // Schema represents the structure of a request or response body.
 type Schema struct {
-	Ref        string            `json:"$ref,omitempty"`       // Reference to a schema
-	Type       string            `json:"type,omitempty"`       // Data type (e.g., "string", "object")
-	Format     string            `json:"format,omitempty"`     // Data format (e.g., "uuid", "email")
-	Properties map[string]Schema `json:"properties,omitempty"` // Properties of the object
-	Items      *Schema           `json:"items,omitempty"`      // Schema for array items
-	Required   []string          `json:"required,omitempty"`   // Required properties
+	Ref                  string            `json:"$ref,omitempty"`                 // Reference to a schema
+	Type                 string            `json:"type,omitempty"`                 // Data type (e.g., "string", "object")
+	Format               string            `json:"format,omitempty"`               // Data format (e.g., "uuid", "email")
+	Properties           map[string]Schema `json:"properties,omitempty"`           // Properties of the object
+	Items                *Schema           `json:"items,omitempty"`                // Schema for array items
+	AdditionalProperties *Schema           `json:"additionalProperties,omitempty"` // Schema for map values
+	Required             []string          `json:"required,omitempty"`             // Required properties
+	Enum                 []any             `json:"enum,omitempty"`                 // Allowed values
+	Nullable             bool              `json:"nullable,omitempty"`             // Whether the value can be null
 }
 
 // Components holds reusable components such as schemas and security schemes.
