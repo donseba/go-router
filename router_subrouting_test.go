@@ -68,6 +68,115 @@ func TestMountRouterUnderPathWithNamedRoutes(t *testing.T) {
 	}
 }
 
+func TestMountedRouterHandlersSeePublicRequestURL(t *testing.T) {
+	parent := New(http.NewServeMux(), "Parent API", "1.0.0")
+	child := New(http.NewServeMux(), "Child API", "1.0.0")
+
+	child.Get("/", func(w http.ResponseWriter, req *http.Request) {
+		_, _ = fmt.Fprint(w, req.URL.Path)
+	})
+	child.Get("/users/{id}", func(w http.ResponseWriter, req *http.Request) {
+		_, _ = fmt.Fprintf(w, "path=%s raw=%s escaped=%s query=%s uri=%s id=%s",
+			req.URL.Path,
+			req.URL.RawPath,
+			req.URL.EscapedPath(),
+			req.URL.RawQuery,
+			req.RequestURI,
+			req.PathValue("id"),
+		)
+	})
+	parent.Mount("/api", child)
+
+	t.Run("mount root", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api", nil)
+		w := httptest.NewRecorder()
+
+		parent.ServeHTTP(w, req)
+
+		if got := w.Body.String(); got != "/api" {
+			t.Fatalf("expected mounted root URL path %q, got %q", "/api", got)
+		}
+	})
+
+	t.Run("route parameters query and escaped path", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/users/a%2Fb?tab=profile", nil)
+		w := httptest.NewRecorder()
+
+		parent.ServeHTTP(w, req)
+
+		want := "path=/api/users/a/b raw=/api/users/a%2Fb escaped=/api/users/a%2Fb query=tab=profile uri=/api/users/a%2Fb?tab=profile id=a/b"
+		if got := w.Body.String(); got != want {
+			t.Fatalf("expected mounted handler request %q, got %q", want, got)
+		}
+	})
+}
+
+func TestMountedRouterMiddlewareSeesPublicRequestURL(t *testing.T) {
+	parent := New(http.NewServeMux(), "Parent API", "1.0.0")
+	child := New(http.NewServeMux(), "Child API", "1.0.0")
+	var parentPath, childPath string
+
+	parent.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			parentPath = req.URL.Path
+			next.ServeHTTP(w, req)
+		})
+	})
+	child.Use(func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			childPath = req.URL.Path
+			next.ServeHTTP(w, req)
+		})
+	})
+	child.Get("/users/{id}", func(w http.ResponseWriter, req *http.Request) {})
+	parent.Mount("/api", child)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/users/42", nil)
+	parent.ServeHTTP(httptest.NewRecorder(), req)
+
+	if parentPath != "/api/users/42" {
+		t.Fatalf("expected parent mount middleware path %q, got %q", "/api/users/42", parentPath)
+	}
+	if childPath != "/api/users/42" {
+		t.Fatalf("expected child route middleware path %q, got %q", "/api/users/42", childPath)
+	}
+}
+
+func TestNestedMountedRouterHandlerSeesOutermostRequestURL(t *testing.T) {
+	parent := New(http.NewServeMux(), "Parent API", "1.0.0")
+	middle := New(http.NewServeMux(), "Middle API", "1.0.0")
+	child := New(http.NewServeMux(), "Child API", "1.0.0")
+
+	child.Get("/users/{id}", func(w http.ResponseWriter, req *http.Request) {
+		_, _ = fmt.Fprintf(w, "%s %s", req.URL.Path, req.PathValue("id"))
+	})
+	middle.Mount("/v1", child)
+	parent.Mount("/api", middle)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/users/42", nil)
+	w := httptest.NewRecorder()
+	parent.ServeHTTP(w, req)
+
+	if got := w.Body.String(); got != "/api/v1/users/42 42" {
+		t.Fatalf("expected nested handler to see outer URL and path value, got %q", got)
+	}
+}
+
+func TestMountedArbitraryHandlerStillSeesStrippedPrefix(t *testing.T) {
+	r := New(http.NewServeMux(), "Example API", "1.0.0")
+	r.Mount("/assets", http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_, _ = fmt.Fprint(w, req.URL.Path)
+	}))
+
+	req := httptest.NewRequest(http.MethodGet, "/assets/app.css", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if got := w.Body.String(); got != "/app.css" {
+		t.Fatalf("expected arbitrary mounted handler path %q, got %q", "/app.css", got)
+	}
+}
+
 func TestMountRouterUnderHostPreservesChildHostRoutes(t *testing.T) {
 	parent := New(http.NewServeMux(), "Parent API", "1.0.0")
 	child := New(http.NewServeMux(), "Child API", "1.0.0")
