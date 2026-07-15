@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -99,7 +100,11 @@ type (
 	}
 
 	Middleware func(http.Handler) http.Handler
+
+	originalRequestURLContextKey struct{}
 )
+
+var originalRequestURLKey originalRequestURLContextKey
 
 func (e RouteError) Error() string {
 	return fmt.Sprintf("%v", e.Err)
@@ -325,6 +330,7 @@ func (r *Router) Handle(pattern string, handler http.Handler) {
 	for i := len(r.middlewares) - 1; i >= 0; i-- {
 		finalHandler = r.middlewares[i](finalHandler)
 	}
+	finalHandler = restoreOriginalRequestURL(finalHandler)
 
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()
@@ -360,7 +366,13 @@ func (r *Router) Mount(pattern string, handler http.Handler) {
 		pattern += "/"
 	}
 
-	var finalHandler http.Handler = http.StripPrefix(strings.TrimSuffix(pattern, "/"), handler)
+	mountPrefix := strings.TrimSuffix(pattern, "/")
+	var finalHandler http.Handler
+	if _, ok := handler.(*Router); ok {
+		finalHandler = preserveOriginalRequestURL(stripMountedRouterPrefix(mountPrefix, handler))
+	} else {
+		finalHandler = http.StripPrefix(mountPrefix, handler)
+	}
 	for i := len(r.middlewares) - 1; i >= 0; i-- {
 		finalHandler = r.middlewares[i](finalHandler)
 	}
@@ -371,13 +383,20 @@ func (r *Router) Mount(pattern string, handler http.Handler) {
 
 	rootRouter.registerRouteInfoLocked(r.hostPattern, "*", pattern, handler, r.middlewares, func(mux *http.ServeMux) {
 		mux.Handle(pattern, finalHandler)
+		if _, ok := handler.(*Router); ok && mountPrefix != "" {
+			mux.Handle(mountPrefix, finalHandler)
+		}
 	})
 	if mountedRouter, ok := handler.(*Router); ok {
 		for childHostPattern := range mountedRouter.rootParent().hostMuxes {
 			if childHostPattern == r.hostPattern {
 				continue
 			}
-			rootRouter.targetMuxLocked(childHostPattern).Handle(pattern, finalHandler)
+			childMux := rootRouter.targetMuxLocked(childHostPattern)
+			childMux.Handle(pattern, finalHandler)
+			if mountPrefix != "" {
+				childMux.Handle(mountPrefix, finalHandler)
+			}
 		}
 		rootRouter.mountRouterLocked(r.hostPattern, strings.TrimSuffix(pattern, "/"), mountedRouter)
 	}
@@ -392,6 +411,68 @@ func (r *Router) TryMount(pattern string, handler http.Handler) (err error) {
 
 	r.Mount(pattern, handler)
 	return nil
+}
+
+func preserveOriginalRequestURL(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.Context().Value(originalRequestURLKey) != nil {
+			next.ServeHTTP(w, req)
+			return
+		}
+
+		originalURL := new(url.URL)
+		*originalURL = *req.URL
+		ctx := context.WithValue(req.Context(), originalRequestURLKey, originalURL)
+		next.ServeHTTP(w, req.WithContext(ctx))
+	})
+}
+
+func restoreOriginalRequestURL(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		originalURL, ok := req.Context().Value(originalRequestURLKey).(*url.URL)
+		if !ok {
+			next.ServeHTTP(w, req)
+			return
+		}
+
+		restoredRequest := new(http.Request)
+		*restoredRequest = *req
+		restoredRequest.URL = new(url.URL)
+		*restoredRequest.URL = *originalURL
+		next.ServeHTTP(w, restoredRequest)
+	})
+}
+
+// stripMountedRouterPrefix keeps the child router's matching path relative to
+// the mount while allowing the mount root itself to match without a redirect.
+func stripMountedRouterPrefix(prefix string, next http.Handler) http.Handler {
+	if prefix == "" {
+		return next
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		path := strings.TrimPrefix(req.URL.Path, prefix)
+		rawPath := strings.TrimPrefix(req.URL.RawPath, prefix)
+		if len(path) >= len(req.URL.Path) || (req.URL.RawPath != "" && len(rawPath) >= len(req.URL.RawPath)) {
+			http.NotFound(w, req)
+			return
+		}
+
+		if path == "" {
+			path = "/"
+		}
+		if req.URL.RawPath != "" && rawPath == "" {
+			rawPath = "/"
+		}
+
+		strippedRequest := new(http.Request)
+		*strippedRequest = *req
+		strippedRequest.URL = new(url.URL)
+		*strippedRequest.URL = *req.URL
+		strippedRequest.URL.Path = path
+		strippedRequest.URL.RawPath = rawPath
+		next.ServeHTTP(w, strippedRequest)
+	})
 }
 
 func (r *Router) ServeFiles(pattern string, fs http.FileSystem) {
@@ -590,6 +671,7 @@ func (r *Router) registerRoute(method, pattern string, handler http.HandlerFunc)
 	for i := len(r.middlewares) - 1; i >= 0; i-- {
 		finalHandler = r.middlewares[i](finalHandler)
 	}
+	finalHandler = restoreOriginalRequestURL(finalHandler)
 
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()

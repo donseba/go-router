@@ -1,5 +1,5 @@
 <p align="center">
-    <img src="./assets/go-router-logo.png" alt="go-doc" width="420">
+    <img src="./assets/go-router-logo.png" alt="go-doc" width="180">
 </p>
 
 `go-router` is a lightweight router for Go websites and APIs. It builds on the standard library `net/http` `ServeMux` and adds the pieces most small and medium applications usually end up needing: route groups, middleware, named routes, host and subdomain routing, mounted routers, OpenAPI helpers, route walking, static files, and practical middleware.
