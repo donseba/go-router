@@ -13,9 +13,13 @@ func ContentLengthMiddleware(next http.Handler) http.Handler {
 			ResponseWriter: w,
 			buffer:         &bytes.Buffer{},
 			statusCode:     http.StatusOK,
+			method:         r.Method,
 		}
 
 		next.ServeHTTP(clw, r)
+		if clw.streaming {
+			return
+		}
 
 		if shouldSetContentLength(r.Method, clw.statusCode) && clw.Header().Get("Content-Length") == "" {
 			clw.Header().Set("Content-Length", strconv.Itoa(clw.buffer.Len()))
@@ -33,6 +37,8 @@ type contentLengthWriter struct {
 	buffer      *bytes.Buffer
 	statusCode  int
 	wroteHeader bool
+	method      string
+	streaming   bool
 }
 
 func (clw *contentLengthWriter) WriteHeader(statusCode int) {
@@ -43,7 +49,45 @@ func (clw *contentLengthWriter) WriteHeader(statusCode int) {
 }
 
 func (clw *contentLengthWriter) Write(data []byte) (int, error) {
+	if !clw.wroteHeader {
+		clw.WriteHeader(http.StatusOK)
+	}
+	if clw.streaming {
+		if !clw.writeBody() {
+			return len(data), nil
+		}
+		return clw.ResponseWriter.Write(data)
+	}
 	return clw.buffer.Write(data)
+}
+
+// Flush switches to streaming, writes buffered data, and leaves Content-Length
+// unset unless the handler supplied it. Subsequent writes go directly through.
+func (clw *contentLengthWriter) Flush() {
+	_ = clw.FlushError()
+}
+
+// FlushError allows http.ResponseController to flush through this middleware.
+func (clw *contentLengthWriter) FlushError() error {
+	if !clw.streaming {
+		if !clw.wroteHeader {
+			clw.WriteHeader(http.StatusOK)
+		}
+		clw.streaming = true
+		clw.ResponseWriter.WriteHeader(clw.statusCode)
+	}
+	if clw.writeBody() {
+		if _, err := clw.buffer.WriteTo(clw.ResponseWriter); err != nil {
+			return err
+		}
+	} else {
+		clw.buffer.Reset()
+	}
+	return http.NewResponseController(clw.ResponseWriter).Flush()
+}
+
+func (clw *contentLengthWriter) writeBody() bool {
+	return clw.method != http.MethodHead && clw.statusCode != http.StatusNoContent && clw.statusCode != http.StatusNotModified
 }
 
 func (clw *contentLengthWriter) Unwrap() http.ResponseWriter {

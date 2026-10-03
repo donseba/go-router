@@ -339,7 +339,7 @@ r.Use(middleware.CORS(middleware.CORSOptions{
 }))
 ```
 
-Avoid `ContentLengthMiddleware` for streaming, SSE, websockets, or reverse proxy style handlers because it buffers the response.
+`ContentLengthMiddleware` buffers ordinary responses to compute their length. Calling `http.NewResponseController(w).Flush()` or `http.Flusher.Flush()` switches to streaming and skips automatic `Content-Length`. Place handlers that hijack the connection, such as websockets, outside this middleware.
 
 ## JSON Helpers
 
@@ -516,7 +516,7 @@ Before shipping an app:
 - Register routes only during startup.
 - Prefer `Try*` registration if you want explicit bootstrap errors.
 - Use `RealIPWithOptions` behind proxies.
-- Avoid response buffering middleware for streaming.
+- Explicitly flush streaming responses and use middleware that supports flushing.
 - Run `go test ./...`, `go test -race ./...`, and `go vet ./...`.
 - Add app-level tests for mounted routers, subdomains, and custom middleware.
 
