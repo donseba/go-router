@@ -281,3 +281,26 @@ func TestCORSMiddlewareCredentialedWildcardEchoesValidOrigin(t *testing.T) {
 		t.Fatalf("expected credentials header, got %q", got)
 	}
 }
+
+// TestCORSMiddlewareVariesWithoutOrigin checks that an answer to a request
+// without an Origin says Vary: Origin too, so that a cache does not give it,
+// without CORS headers, to an allowed origin.
+func TestCORSMiddlewareVariesWithoutOrigin(t *testing.T) {
+	handler := middleware.CORS(middleware.CORSOptions{
+		AllowedOrigins: []string{"https://example.com"},
+	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+
+	for _, origin := range []string{"", "https://example.com"} {
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		if got := w.Header().Values("Vary"); len(got) != 1 || got[0] != "Origin" {
+			t.Fatalf("origin %q: Vary %q, want Origin", origin, got)
+		}
+	}
+}

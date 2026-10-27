@@ -5,11 +5,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -36,15 +38,48 @@ type (
 		docs                  []Docs
 		parent                *Router // Reference to the parent router
 
+		// around is the middleware of UseAll and served the router's
+		// requests through it, nil without UseAll.
+		around       []Middleware
+		aroundServed http.Handler
+
 		handleStatus map[int]http.HandlerFunc
 		hostMuxes    map[string]*http.ServeMux
 		patternMap   map[string]string
 		routes       map[string]RouteInfo
 		routeList    []RouteInfo
-		routeKeys    map[string]struct{}
+		routeKeys    map[string]int // index in routeList by routeKey
+		methods      []string       // the methods of the routes, for Owns
 		redirects    []redirectTrailingSlashPolicy
+		mounted      []*Router
+		mountedOn    []*mountLink  // where this root router is mounted
+		outbox       []mountChange // changes for the routers it is mounted on
+		hasRoutes    bool
 		frozen       bool
 		freezeOnce   sync.Once
+
+		// fallbacks are the NotFound and MethodNotAllowed handlers, installed
+		// on the ServeMuxes when the router freezes.
+		fallbacks          []fallback
+		fallbacksInstalled bool
+
+		// trackRoutes is set by TrackRoutes; tracks when the router froze
+		// with it set on itself or on a router mounted on it: requests then
+		// record their matched route (MatchedRoute).
+		trackRoutes bool
+		tracks      bool
+		// wrapped is set when the router froze mounted through a wrapper
+		// (see Mount), whose requests ServeHTTP then looks for.
+		wrapped bool
+		// slashRoutes is set when the router froze with a route its
+		// ServeMux redirects the path without a trailing slash to, such as
+		// "/users/": as a mounted router, it then corrects those redirects
+		// (see redirectMounted).
+		slashRoutes bool
+
+		// servedAt is the mount of a request a router returned by For gives
+		// public paths for (ServeAt).
+		servedAt *mountLink
 
 		once    sync.Once
 		mu      sync.RWMutex
@@ -52,12 +87,29 @@ type (
 	}
 
 	RouteInfo struct {
-		Method      string
-		Path        string
+		Method string
+		// Path is the route's path for reverse routing: the registered
+		// pattern without {$}, so "/admin/{$}" and "/admin/" are "/admin/".
+		Path string
+		// Pattern is the registered ServeMux pattern, such as "/admin/{$}".
+		Pattern     string
 		Host        string
 		Name        string
 		Handler     http.Handler
 		Middlewares []Middleware
+		// Labels are the labels of the route and of the mounts it is below
+		// (RouteRegistration.Label).
+		Labels []string
+		// Mount reports that the registration is a mount (Mount, ServeAt)
+		// rather than a route. Match and MatchedRoute report the mount of a
+		// mounted router for the requests none of its routes matches.
+		Mount bool
+		// Redirect is set by Match and Owns for a path the
+		// router redirects before the route serves it: the path the
+		// redirects lead to, such as "/theme/" for "/theme" with a route
+		// "/theme/{file...}", or "/admin/users" for "/admin//users". It is
+		// "" for a path served as it is, and in Walk and MatchedRoute.
+		Redirect string
 	}
 
 	WalkFunc func(RouteInfo) error
@@ -73,6 +125,8 @@ type (
 		path   string
 		name   string
 		router *Router
+		entry  *routeEntry
+		mount  *mountLink // a mounted router
 	}
 
 	Docs struct {
@@ -100,11 +154,7 @@ type (
 	}
 
 	Middleware func(http.Handler) http.Handler
-
-	originalRequestURLContextKey struct{}
 )
-
-var originalRequestURLKey originalRequestURLContextKey
 
 func (e RouteError) Error() string {
 	return fmt.Sprintf("%v", e.Err)
@@ -131,17 +181,20 @@ func New(ht *http.ServeMux, title string, version string) *Router {
 		hostMuxes:    make(map[string]*http.ServeMux),
 		patternMap:   make(map[string]string),
 		routes:       make(map[string]RouteInfo),
-		routeKeys:    make(map[string]struct{}),
+		routeKeys:    make(map[string]int),
 	}
 }
 
+// AddServerEndpoint adds a server, its URL and description, to the OpenAPI
+// document of the router. A group, host or With router adds it to the
+// document of the router it belongs to.
 func (r *Router) AddServerEndpoint(url string, description string) {
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()
 	defer rootRouter.mu.Unlock()
 	rootRouter.ensureMutableLocked()
 
-	r.openapi.Servers = append(r.openapi.Servers, Server{
+	rootRouter.openapi.Servers = append(rootRouter.openapi.Servers, Server{
 		URL:         url,
 		Description: description,
 	})
@@ -238,11 +291,14 @@ func (r *Router) Host(hostPattern string, fn func(*Router)) {
 	rootRouter := r.rootParent()
 
 	rootRouter.mu.Lock()
-	rootRouter.ensureMutableLocked()
-	if _, exists := rootRouter.hostMuxes[hostPattern]; !exists {
-		rootRouter.hostMuxes[hostPattern] = http.NewServeMux()
-	}
-	rootRouter.mu.Unlock()
+	func() {
+		defer rootRouter.mu.Unlock()
+
+		rootRouter.ensureMutableLocked()
+		rootRouter.hostMuxLocked(hostPattern)
+	}()
+
+	rootRouter.flush()
 
 	subRouter := &Router{
 		basePath:              r.basePath,
@@ -305,6 +361,11 @@ func (r *Router) UseDocs(doc Docs) {
 	r.docs = append(r.docs, doc)
 }
 
+// HandleStatus registers a handler for responses with the given status, such
+// as the 404 and 405 answers of the router and the 404s of handlers: the
+// response is dropped and handler answers instead. A handler keeps its own
+// response with NoIntercept. Status handlers run inside UseAll middleware,
+// but not inside the middleware of Use (see Use for what that covers).
 func (r *Router) HandleStatus(httpStatus int, handler http.HandlerFunc) {
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()
@@ -314,239 +375,332 @@ func (r *Router) HandleStatus(httpStatus int, handler http.HandlerFunc) {
 	r.handleStatus[httpStatus] = handler
 }
 
+// Use adds middleware to the routes registered on this router (and its groups)
+// after the call. Middleware is applied when a route is registered, so Use
+// must come before the routes: it panics when routes were already registered
+// on this router or on one of its groups, since those would silently miss the
+// middleware. Use Group or With for routes that need different middleware,
+// or Use on a single route (RouteRegistration.Use).
+//
+// Use middleware runs around the handlers registered after it on this
+// router and its groups:
+//
+//   - its routes, and every request of a Mount, which is a route as well,
+//     so also the requests a mounted router answers without a route of
+//     its own, such as its 404 answers;
+//   - the NotFound and MethodNotAllowed handlers set on this router or one
+//     of its groups, also when they were set before Use (the router builds
+//     their chain when it freezes).
+//
+// It does not run for what the router answers without a handler: its plain
+// 404 and 405 answers when no NotFound or MethodNotAllowed handler applies,
+// trailing slash redirects and the redirects of the ServeMux (such as
+// unclean paths), nor for HandleStatus handlers and requests that UseAll
+// middleware answers itself. UseAll, or wrapping the router itself, as in
+// http.ListenAndServe(addr, middleware.RequestID(r)), covers every request.
 func (r *Router) Use(middleware Middleware) {
 	rootRouter := r.rootParent()
 	rootRouter.mu.Lock()
 	defer rootRouter.mu.Unlock()
 	rootRouter.ensureMutableLocked()
 
+	if r.hasRoutes {
+		panic("router: Use after routes were registered; register middleware before routes, or use Group or With")
+	}
+
 	r.middlewares = append(r.middlewares, middleware)
 }
 
-func (r *Router) Handle(pattern string, handler http.Handler) {
-	pattern = r.fullPattern(pattern)
-
-	var finalHandler http.Handler = handler
-	for i := len(r.middlewares) - 1; i >= 0; i-- {
-		finalHandler = r.middlewares[i](finalHandler)
+// UseAll adds middleware around the whole router: unlike Use, it runs for
+// every request the router serves, before a route is matched, so also for
+// trailing slash redirects and other redirects, the router's plain 404 and
+// 405 answers and HandleStatus handlers, next to routes and NotFound and
+// MethodNotAllowed handlers.
+// It is the same as wrapping the router, r.UseAll(a, b) serves as a(b(r)),
+// and suits request IDs, logging, recovery and real IP middleware:
+//
+//	r.UseAll(middleware.RequestID, middleware.Logger(), middleware.Recover)
+//
+// UseAll middleware runs before the route is matched: req.PathValue is
+// empty and Use middleware has not run yet. A router mounted on another runs
+// its UseAll middleware for the requests that reach it, with the request URL
+// as the outer router received it, like its routes.
+//
+// UseAll can be called after routes were registered, but only on the router
+// itself, not on a group, With or host router, since it applies to all of
+// the router's requests. It panics on those and after the first request.
+func (r *Router) UseAll(middlewares ...Middleware) {
+	if r.parent != nil {
+		panic("router: UseAll on a group, With or host router; call it on the router itself")
 	}
-	finalHandler = restoreOriginalRequestURL(finalHandler)
 
-	rootRouter := r.rootParent()
-	rootRouter.mu.Lock()
-	defer rootRouter.mu.Unlock()
+	r.update(func() {
+		r.ensureMutableLocked()
 
-	rootRouter.registerRouteInfoLocked(r.hostPattern, "", pattern, handler, r.middlewares, func(mux *http.ServeMux) {
-		mux.Handle(pattern, finalHandler)
+		r.around = append(r.around, middlewares...)
+		r.aroundServed = wrapMiddleware(http.HandlerFunc(r.serveAround), r.around)
 	})
 }
 
-func (r *Router) TryHandle(pattern string, handler http.Handler) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = RouteError{Err: recovered}
-		}
-	}()
+// TrackRoutes has the router record which route serves each request, for
+// MatchedRoute and MatchedLabel, in UseAll middleware and in the routes'
+// own middleware and handlers. It costs two allocations per request, the
+// request with its state in the context, so it is off by default. A router mounted on another with TrackRoutes has the router it is
+// mounted on record its requests too. TrackRoutes panics after the first
+// request.
+func (r *Router) TrackRoutes() {
+	rootRouter := r.rootParent()
+	rootRouter.mu.Lock()
+	defer rootRouter.mu.Unlock()
+	rootRouter.ensureMutableLocked()
 
-	r.Handle(pattern, handler)
-	return nil
+	rootRouter.trackRoutes = true
 }
 
-func (r *Router) HandleFunc(pattern string, handler http.HandlerFunc) {
-	r.Handle(pattern, handler)
+// markRoutesLocked records that r and the routers it belongs to have routes,
+// so that a later Use, which would not apply to them, panics.
+func (r *Router) markRoutesLocked() {
+	for router := r; router != nil; router = router.parent {
+		router.hasRoutes = true
+	}
 }
 
-func (r *Router) TryHandleFunc(pattern string, handler http.HandlerFunc) error {
+// Handle serves handler at pattern, a ServeMux pattern that may start with a
+// method, such as "/feed.xml", "/theme/" or "GET /files/{path...}", and
+// returns the route, so it can be named, labelled and get route middleware.
+// The handler sees the full request URL, also in a mounted router; see Mount
+// for a handler that wants the path below a prefix.
+func (r *Router) Handle(pattern string, handler http.Handler) *RouteRegistration {
+	method := ""
+
+	// A method comes first, followed by a space: "GET /feed.xml".
+	if before, after, found := strings.Cut(pattern, " "); found && !strings.Contains(before, "/") {
+		method = before
+		pattern = strings.TrimLeft(after, " \t")
+	}
+
+	return r.registerRoute(method, r.fullPattern(pattern), handler)
+}
+
+// TryHandle is Handle returning an error instead of panicking, such as for
+// a pattern registered twice. The route is nil when err is set.
+func (r *Router) TryHandle(pattern string, handler http.Handler) (routeRegistration *RouteRegistration, err error) {
+	defer recoverRouteError(&err)
+
+	return r.Handle(pattern, handler), nil
+}
+
+// HandleFunc is Handle for a handler function.
+func (r *Router) HandleFunc(pattern string, handler http.HandlerFunc) *RouteRegistration {
+	return r.Handle(pattern, handler)
+}
+
+// TryHandleFunc is HandleFunc returning an error instead of panicking.
+func (r *Router) TryHandleFunc(pattern string, handler http.HandlerFunc) (*RouteRegistration, error) {
 	return r.TryHandle(pattern, handler)
 }
 
-func (r *Router) Mount(pattern string, handler http.Handler) {
-	pattern = r.fullPattern(pattern)
-	if pattern == "" || pattern[len(pattern)-1] != '/' {
+// TryMount is Mount returning an error instead of panicking, such as for a
+// mount path taken by another mount or route of the same pattern, a router
+// mounted on itself, or route names of the mounted router that this router
+// has already. The mount is nil when err is set; otherwise it can be
+// labelled and get middleware as Mount's:
+//
+//	mount, err := r.TryMount("/admin", admin, router.AbsolutePaths())
+//	if err != nil {
+//		return err
+//	}
+//
+//	if err := mount.TryLabel("admin"); err != nil {
+//		return err
+//	}
+func (r *Router) TryMount(
+	pattern string,
+	handler http.Handler,
+	options ...MountOption,
+) (routeRegistration *RouteRegistration, err error) {
+	defer recoverRouteError(&err)
+
+	return r.Mount(pattern, handler, options...), nil
+}
+
+// ServeFiles serves the files of fs with GET below pattern, and returns the
+// route, so it can be named and get route middleware. The route's pattern
+// ends in a rest wildcard, {file...} unless pattern ends in one of its own,
+// which gives the file's path when the route is reversed:
+//
+//	r.ServeFiles("/assets/", http.FS(assets)).As("assets")
+//	r.RoutePathArgs("assets", "file", "css/site.css") // "/assets/css/site.css"
+//
+//	r.ServeFiles("/static/{path...}", http.Dir("static")).As("static")
+//	r.RoutePathArgs("static", "path", "logo.svg") // "/static/logo.svg"
+//
+// "/assets", "/assets/" and "/assets/{file...}" are the same route. The file
+// server gets the wildcard's value as its path, so ServeFiles works the same
+// in groups, hosts and mounted routers.
+func (r *Router) ServeFiles(pattern string, fs http.FileSystem) *RouteRegistration {
+	pattern, wildcard := filesPattern(r.fullPattern(pattern))
+	fileServer := http.FileServer(fs)
+
+	return r.registerRoute(http.MethodGet, pattern, http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		fileServer.ServeHTTP(w, withRequestPath(req, "/"+req.PathValue(wildcard)))
+	}))
+}
+
+// ServeFile serves the file at filepath with GET at pattern, and returns the
+// route, so it can be named and get route middleware.
+func (r *Router) ServeFile(pattern string, filepath string) *RouteRegistration {
+	return r.registerRoute(
+		http.MethodGet,
+		r.fullPattern(pattern),
+		http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			http.ServeFile(w, req, filepath)
+		}),
+	)
+}
+
+// filesPattern returns the pattern of ServeFiles and the name of its rest
+// wildcard: pattern when it ends in one, and otherwise pattern with a
+// trailing slash and {file...}.
+func filesPattern(pattern string) (string, string) {
+	if strings.HasSuffix(pattern, "...}") {
+		open := strings.LastIndexByte(pattern, '{')
+
+		return pattern, pattern[open+1 : len(pattern)-len("...}")]
+	}
+
+	if !strings.HasSuffix(pattern, "/") {
 		pattern += "/"
 	}
 
-	mountPrefix := strings.TrimSuffix(pattern, "/")
-	var finalHandler http.Handler
-	if _, ok := handler.(*Router); ok {
-		finalHandler = preserveOriginalRequestURL(stripMountedRouterPrefix(mountPrefix, handler))
-	} else {
-		finalHandler = http.StripPrefix(mountPrefix, handler)
-	}
-	for i := len(r.middlewares) - 1; i >= 0; i-- {
-		finalHandler = r.middlewares[i](finalHandler)
-	}
-
-	rootRouter := r.rootParent()
-	rootRouter.mu.Lock()
-	defer rootRouter.mu.Unlock()
-
-	rootRouter.registerRouteInfoLocked(r.hostPattern, "*", pattern, handler, r.middlewares, func(mux *http.ServeMux) {
-		mux.Handle(pattern, finalHandler)
-		if _, ok := handler.(*Router); ok && mountPrefix != "" {
-			mux.Handle(mountPrefix, finalHandler)
-		}
-	})
-	if mountedRouter, ok := handler.(*Router); ok {
-		for childHostPattern := range mountedRouter.rootParent().hostMuxes {
-			if childHostPattern == r.hostPattern {
-				continue
-			}
-			childMux := rootRouter.targetMuxLocked(childHostPattern)
-			childMux.Handle(pattern, finalHandler)
-			if mountPrefix != "" {
-				childMux.Handle(mountPrefix, finalHandler)
-			}
-		}
-		rootRouter.mountRouterLocked(r.hostPattern, strings.TrimSuffix(pattern, "/"), mountedRouter)
-	}
+	return pattern + "{file...}", "file"
 }
 
-func (r *Router) TryMount(pattern string, handler http.Handler) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = RouteError{Err: recovered}
-		}
-	}()
+// withRequestPath returns a shallow copy of req with path as its URL path.
+func withRequestPath(req *http.Request, path string) *http.Request {
+	pathRequest := withRequestURL(req, req.URL)
+	pathRequest.URL.Path = path
+	pathRequest.URL.RawPath = ""
 
-	r.Mount(pattern, handler)
-	return nil
-}
-
-func preserveOriginalRequestURL(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Context().Value(originalRequestURLKey) != nil {
-			next.ServeHTTP(w, req)
-			return
-		}
-
-		originalURL := new(url.URL)
-		*originalURL = *req.URL
-		ctx := context.WithValue(req.Context(), originalRequestURLKey, originalURL)
-		next.ServeHTTP(w, req.WithContext(ctx))
-	})
-}
-
-func restoreOriginalRequestURL(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		originalURL, ok := req.Context().Value(originalRequestURLKey).(*url.URL)
-		if !ok {
-			next.ServeHTTP(w, req)
-			return
-		}
-
-		restoredRequest := new(http.Request)
-		*restoredRequest = *req
-		restoredRequest.URL = new(url.URL)
-		*restoredRequest.URL = *originalURL
-		next.ServeHTTP(w, restoredRequest)
-	})
-}
-
-// stripMountedRouterPrefix keeps the child router's matching path relative to
-// the mount while allowing the mount root itself to match without a redirect.
-func stripMountedRouterPrefix(prefix string, next http.Handler) http.Handler {
-	if prefix == "" {
-		return next
-	}
-
-	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		path := strings.TrimPrefix(req.URL.Path, prefix)
-		rawPath := strings.TrimPrefix(req.URL.RawPath, prefix)
-		if len(path) >= len(req.URL.Path) || (req.URL.RawPath != "" && len(rawPath) >= len(req.URL.RawPath)) {
-			http.NotFound(w, req)
-			return
-		}
-
-		if path == "" {
-			path = "/"
-		}
-		if req.URL.RawPath != "" && rawPath == "" {
-			rawPath = "/"
-		}
-
-		strippedRequest := new(http.Request)
-		*strippedRequest = *req
-		strippedRequest.URL = new(url.URL)
-		*strippedRequest.URL = *req.URL
-		strippedRequest.URL.Path = path
-		strippedRequest.URL.RawPath = rawPath
-		next.ServeHTTP(w, strippedRequest)
-	})
-}
-
-func (r *Router) ServeFiles(pattern string, fs http.FileSystem) {
-	pattern = r.fullPattern(pattern)
-
-	// Ensure the pattern ends with "/" for directory serving
-	if pattern == "" || pattern[len(pattern)-1] != '/' {
-		pattern += "/"
-	}
-
-	// Create a file server handler
-	fileServer := http.StripPrefix(pattern, http.FileServer(fs))
-
-	// Wrap the file server with middlewares
-	var finalHandler http.Handler = fileServer
-	for i := len(r.middlewares) - 1; i >= 0; i-- {
-		finalHandler = r.middlewares[i](finalHandler)
-	}
-
-	// Register the handler for GET method
-	rootRouter := r.rootParent()
-	rootRouter.mu.Lock()
-	defer rootRouter.mu.Unlock()
-
-	rootRouter.registerRouteInfoLocked(r.hostPattern, http.MethodGet, pattern, fileServer, r.middlewares, func(mux *http.ServeMux) {
-		mux.Handle("GET "+pattern, finalHandler)
-	})
-}
-
-func (r *Router) ServeFile(pattern string, filepath string) {
-	pattern = r.fullPattern(pattern)
-
-	// Handler to serve the file
-	handler := func(w http.ResponseWriter, req *http.Request) {
-		http.ServeFile(w, req, filepath)
-	}
-
-	// Wrap the handler with middlewares
-	var finalHandler http.Handler = http.HandlerFunc(handler)
-	for i := len(r.middlewares) - 1; i >= 0; i-- {
-		finalHandler = r.middlewares[i](finalHandler)
-	}
-
-	// Register the handler for GET method
-	fullPattern := "GET " + pattern
-	rootRouter := r.rootParent()
-	rootRouter.mu.Lock()
-	defer rootRouter.mu.Unlock()
-
-	rootRouter.registerRouteInfoLocked(r.hostPattern, http.MethodGet, pattern, http.HandlerFunc(handler), r.middlewares, func(mux *http.ServeMux) {
-		mux.Handle(fullPattern, finalHandler)
-	})
+	return pathRequest
 }
 
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	// just before serving add all the option handlers based on the openapi paths
 	if r.openapiDocs {
 		r.once.Do(func() {
-			for p, _ := range r.openapi.Paths {
-				fmt.Println("Registering options handler for", p)
+			for p := range r.openapi.Paths {
 				r.registerOptionsHandler(p)
 			}
 		})
 	}
+
 	r.freeze()
 
-	if r.shouldRedirectTrailingSlash(req) {
-		if req.URL.Path != "/" && req.URL.Path[len(req.URL.Path)-1] == '/' {
-			http.Redirect(w, req, req.URL.Path[:len(req.URL.Path)-1], DefaultRedirectStatusCode)
-			return
+	// Only routers that need the request's state look it up: the serving
+	// hot path stays free of it.
+	var state *requestState
+	if r.tracks || r.wrapped {
+		state = requestStateOf(req)
+	}
+
+	if state != nil && state.wrapped == r {
+		r.serveWrapped(w, req, state)
+
+		return
+	}
+
+	if r.tracks && (state == nil || state.innermost() != r) {
+		req, state = withRequestState(req, r)
+	}
+
+	if r.aroundServed != nil {
+		r.serveThroughAround(w, req, state)
+
+		return
+	}
+
+	r.serve(w, req)
+}
+
+// serveWrapped serves a request a wrapper of this mounted router (see
+// Mount) passed on: matched with the URL below the mount path, while UseAll
+// middleware sees the URL as the outer router received it, as the wrapper
+// did.
+func (r *Router) serveWrapped(w http.ResponseWriter, req *http.Request, state *requestState) {
+	inner := state.wrappedURL
+	state.wrapped = nil
+	state.wrappedURL = nil
+
+	if r.aroundServed == nil {
+		r.serve(w, withRequestURL(req, inner))
+
+		return
+	}
+
+	ctx := context.WithValue(req.Context(), aroundContextKey{}, aroundRequest{router: r, url: inner})
+	r.aroundServed.ServeHTTP(w, req.WithContext(ctx))
+}
+
+// aroundContextKey holds the URL a mounted router matches a request with,
+// while its UseAll middleware sees the request URL of the outer router.
+type aroundContextKey struct{}
+
+type aroundRequest struct {
+	router *Router
+	url    *url.URL
+}
+
+// serveThroughAround serves req through the UseAll middleware. A mounted
+// router's middleware gets the request URL as the outer router received it,
+// as its routes do; serveAround matches with the URL below the mount.
+func (r *Router) serveThroughAround(w http.ResponseWriter, req *http.Request, state *requestState) {
+	if state == nil {
+		state = requestStateOf(req)
+	}
+
+	if state == nil || !state.mounted() || state.innermost() != r {
+		r.aroundServed.ServeHTTP(w, req)
+
+		return
+	}
+
+	ctx := context.WithValue(req.Context(), aroundContextKey{}, aroundRequest{router: r, url: req.URL})
+	r.aroundServed.ServeHTTP(w, withRequestURL(req.WithContext(ctx), state.url))
+}
+
+// serveAround is the handler inside the UseAll middleware.
+func (r *Router) serveAround(w http.ResponseWriter, req *http.Request) {
+	if around, ok := req.Context().Value(aroundContextKey{}).(aroundRequest); ok && around.router == r {
+		req = withRequestURL(req, around.url)
+	}
+
+	r.serve(w, req)
+}
+
+// serve routes a request: trailing slash redirects, the ServeMux of the
+// request's host and the HandleStatus handlers.
+func (r *Router) serve(w http.ResponseWriter, req *http.Request) {
+	if r.redirectsTrailingSlash(req.Host, req.URL.Path) && !r.keepsTrailingSlash(req.Host, req.Method, req.URL.Path) {
+		target := req.URL.Path
+
+		// A mounted router redirects to the public path.
+		if state := requestStateOf(req); state != nil && state.mounted() && state.innermost() == r {
+			target = state.url.Path
 		}
+
+		http.Redirect(w, req, strings.TrimSuffix(target, "/"), DefaultRedirectStatusCode)
+
+		return
 	}
 
 	mux := r.selectMux(req.Host)
+
+	// A mounted router serves its requests on its root router.
+	if root := r.rootParent(); root.slashRoutes && root.redirectMounted(w, req, mux) {
+		return
+	}
+
 	if len(r.handleStatus) == 0 {
 		mux.ServeHTTP(w, req)
 		return
@@ -581,10 +735,74 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+// redirectMounted answers a request of a mounted router that its ServeMux
+// redirects, such as "/users" to "/users/" below the mount path /admin,
+// with the redirect to the public path, "/admin/users/": the ServeMux only
+// knows the path below the mount path. It reports whether it answered.
+func (r *Router) redirectMounted(w http.ResponseWriter, req *http.Request, mux *http.ServeMux) bool {
+	if strings.HasSuffix(req.URL.Path, "/") {
+		return false
+	}
+
+	state := requestStateOf(req)
+	if state == nil || !state.mounted() || state.innermost() != r || !state.links[len(state.links)-1].strip {
+		return false
+	}
+
+	handler, pattern := mux.Handler(req)
+	if !isMuxRedirect(handler, pattern, req.Method, req.URL) {
+		return false
+	}
+
+	// The public path ends in the path below the mount path.
+	prefix, below := strings.CutSuffix(state.url.EscapedPath(), req.URL.EscapedPath())
+	if !below {
+		return false
+	}
+
+	redirect := &redirectRecorder{header: make(http.Header)}
+	handler.ServeHTTP(redirect, req)
+
+	http.Redirect(w, req, prefix+redirect.header.Get("Location"), redirect.status)
+
+	return true
+}
+
+// redirectRecorder keeps the status and Location of a ServeMux redirect.
+type redirectRecorder struct {
+	header http.Header
+	status int
+}
+
+func (w *redirectRecorder) Header() http.Header {
+	return w.header
+}
+
+func (w *redirectRecorder) Write(data []byte) (int, error) {
+	return len(data), nil
+}
+
+func (w *redirectRecorder) WriteHeader(status int) {
+	w.status = status
+}
+
+// hasSlashRouteLocked reports whether root router r has a route below the
+// root whose pattern ends in a slash, {$} or a rest wildcard: one its
+// ServeMux redirects the path without the trailing slash to.
+func (r *Router) hasSlashRouteLocked() bool {
+	for _, routeInfo := range r.routeList {
+		if slashPattern(routeInfo.Pattern) && strings.Count(routeInfo.Pattern, "/") > 1 {
+			return true
+		}
+	}
+
+	return false
+}
+
 func (r *Router) handle(method, pattern string, handler http.HandlerFunc, docs ...Docs) *RouteRegistration {
 	pattern = r.fullPattern(pattern)
 
-	routeRegistration := r.registerRoute(method, pattern, handler)
+	routeRegistration := r.registerRoute(method, pattern, http.Handler(handler))
 	if r.openapiDocs {
 		r.registerDocs(method, pattern, r.mergeDocs(docs)...)
 	}
@@ -662,37 +880,53 @@ func mergeDoc(base Docs, override Docs) Docs {
 	return base
 }
 
-func (r *Router) registerRoute(method, pattern string, handler http.HandlerFunc) *RouteRegistration {
+// registerRoute registers handler for method (none for "") at pattern, a
+// full pattern, as a route.
+func (r *Router) registerRoute(method, pattern string, handler http.Handler) *RouteRegistration {
 	var (
-		fullPattern               = method + " " + pattern
-		finalHandler http.Handler = handler
+		muxPattern = pattern
+		rootRouter = r.rootParent()
+		entry      = newRouteEntry(handler, r.middlewares)
 	)
 
-	for i := len(r.middlewares) - 1; i >= 0; i-- {
-		finalHandler = r.middlewares[i](finalHandler)
+	if method != "" {
+		muxPattern = method + " " + pattern
 	}
-	finalHandler = restoreOriginalRequestURL(finalHandler)
 
-	rootRouter := r.rootParent()
-	rootRouter.mu.Lock()
-	defer rootRouter.mu.Unlock()
+	entry.root = rootRouter
+	entry.method = method
+	entry.pattern = pattern
+	entry.host = r.hostPattern
 
-	rootRouter.registerRouteInfoLocked(r.hostPattern, method, pattern, http.HandlerFunc(handler), r.middlewares, func(mux *http.ServeMux) {
-		mux.Handle(fullPattern, finalHandler)
+	rootRouter.update(func() {
+		rootRouter.registerRouteInfoLocked(r.hostPattern, method, pattern, handler, r.middlewares, func(mux *http.ServeMux) {
+			mux.Handle(muxPattern, entry)
+		})
+		r.markRoutesLocked()
 	})
 
 	return &RouteRegistration{
 		method: method,
 		path:   pattern,
 		router: r,
+		entry:  entry,
 	}
 }
 
-func (rr *RouteRegistration) As(name string) {
+// As names the route, for reverse routing (RoutePath, RoutePathArgs, the
+// route template function and the like), and returns it, so calls chain:
+// r.Get("/users/{id}", show).As("users.show").Use(auth). A name can only be
+// given to one route; As panics on a name in use, and after the first
+// request. TryAs returns an error instead.
+func (rr *RouteRegistration) As(name string) *RouteRegistration {
 	rr.name = name
 	rr.syncNamedRoute()
+
+	return rr
 }
 
+// TryAs is As returning an error instead of panicking, such as for a name
+// another route has.
 func (rr *RouteRegistration) TryAs(name string) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -710,28 +944,44 @@ func (rr *RouteRegistration) syncNamedRoute() {
 	}
 
 	rootRouter := rr.router.rootParent()
-	rootRouter.mu.Lock()
-	defer rootRouter.mu.Unlock()
-	rootRouter.ensureMutableLocked()
+	rootRouter.update(func() {
+		rootRouter.ensureMutableLocked()
 
-	if existing, exists := rootRouter.routes[rr.name]; exists && (existing.Method != rr.method || existing.Path != routeNamePath(rr.path) || existing.Host != rr.router.hostPattern) {
-		panic(fmt.Sprintf("router: duplicate route name %q", rr.name))
-	}
-
-	routeInfo := RouteInfo{
-		Method: rr.method,
-		Path:   routeNamePath(rr.path),
-		Host:   rr.router.hostPattern,
-		Name:   rr.name,
-	}
-
-	rootRouter.routes[rr.name] = routeInfo
-	for i, registeredRoute := range rootRouter.routeList {
-		if registeredRoute.Method == routeInfo.Method && registeredRoute.Path == routeInfo.Path && registeredRoute.Host == routeInfo.Host {
-			rootRouter.routeList[i].Name = rr.name
-			break
+		if rr.entry != nil {
+			rr.entry.name = rr.name
 		}
+
+		rootRouter.nameRouteLocked(RouteInfo{
+			Method:  rr.method,
+			Path:    routeNamePath(rr.path),
+			Pattern: rr.path,
+			Host:    rr.router.hostPattern,
+			Name:    rr.name,
+		})
+	})
+}
+
+// nameRouteLocked names the route of routeInfo, which has the route's
+// method, host and pattern. A name can only be given to one route.
+func (r *Router) nameRouteLocked(routeInfo RouteInfo) {
+	key := routeKey(routeInfo)
+	if existing, exists := r.routes[routeInfo.Name]; exists && routeKey(existing) != key {
+		panic(fmt.Sprintf("router: duplicate route name %q", routeInfo.Name))
 	}
+
+	r.routes[routeInfo.Name] = RouteInfo{
+		Method:  routeInfo.Method,
+		Path:    routeInfo.Path,
+		Pattern: routeInfo.Pattern,
+		Host:    routeInfo.Host,
+		Name:    routeInfo.Name,
+	}
+
+	if i, exists := r.routeKeys[key]; exists {
+		r.routeList[i].Name = routeInfo.Name
+	}
+
+	r.recordLocked(mountChange{kind: routeNamed, route: r.routes[routeInfo.Name]})
 }
 
 func (r *Router) Routes() map[string]RouteInfo {
@@ -762,71 +1012,20 @@ func (r *Router) Walk(fn WalkFunc) error {
 	return nil
 }
 
+// RoutePath returns the path pattern of the named route, such as
+// "/users/{id}", or "" for an unknown route. A router mounted on another
+// returns the path the route is served at, below the mount path.
 func (r *Router) RoutePath(name string) string {
-	rootRouter := r.rootParent()
-	rootRouter.mu.RLock()
-	defer rootRouter.mu.RUnlock()
+	routeInfo, _ := r.namedRoute(name)
 
-	if routeInfo, ok := rootRouter.routes[name]; ok {
-		return routeInfo.Path
-	}
-
-	return ""
+	return routeInfo.Path
 }
 
-func (r *Router) RoutePathWithParams(name string, params map[string]any) string {
-	path := r.RoutePath(name)
-	if path == "" {
-		return ""
-	}
-
-	for key, value := range params {
-		path = strings.ReplaceAll(path, "{"+key+"}", url.PathEscape(toString(value)))
-	}
-
-	return path
-}
-
+// RouteHost returns the host pattern of the named route, or "".
 func (r *Router) RouteHost(name string) string {
-	rootRouter := r.rootParent()
-	rootRouter.mu.RLock()
-	defer rootRouter.mu.RUnlock()
+	routeInfo, _ := r.namedRoute(name)
 
-	if routeInfo, ok := rootRouter.routes[name]; ok {
-		return routeInfo.Host
-	}
-
-	return ""
-}
-
-func (r *Router) RouteURL(name string, params map[string]any, scheme string) string {
-	rootRouter := r.rootParent()
-	rootRouter.mu.RLock()
-	routeInfo, ok := rootRouter.routes[name]
-	rootRouter.mu.RUnlock()
-	if !ok {
-		return ""
-	}
-
-	path := r.routePathWithParams(routeInfo.Path, params)
-	if routeInfo.Host == "" {
-		return path
-	}
-
-	host := routeURLHost(routeInfo.Host, params)
-	if scheme == "" {
-		return "//" + host + path
-	}
-
-	return scheme + "://" + host + path
-}
-
-func (r *Router) routePathWithParams(path string, params map[string]any) string {
-	for key, value := range params {
-		path = strings.ReplaceAll(path, "{"+key+"}", url.PathEscape(toString(value)))
-	}
-
-	return path
+	return routeInfo.Host
 }
 
 func (r *Router) RouteTable() string {
@@ -854,6 +1053,28 @@ func (r *Router) WriteRouteTable(w io.Writer) error {
 	})
 }
 
+// FuncMap returns template functions for named routes:
+//
+//   - routePath name: the route's pattern, such as "/users/{id}"
+//   - route name [key value]... [params map] [query url.Values]: the route's
+//     path with its parameters filled in, and a query string; an unknown
+//     route, a missing or an unknown parameter fails the template. See
+//     RoutePathArgs
+//   - hasRoute name: whether the route exists (HasRoute), for links to
+//     routes that are optional
+//   - routeOr name fallback [args]...: route, or fallback for an unknown
+//     route, without an error or a warning; parameter errors of a route that
+//     exists still fail the template
+//   - routePathWithParams name params: RoutePathWithParams
+//   - routeHost name: RouteHost
+//   - routeURL name params scheme: RouteURL
+//   - isActiveRoute current name [args]...: whether current is the route's
+//     path or below it (IsActiveRoute); isActiveRouteExact current name
+//     [args]...: whether it is the route's path (IsActiveRouteExact)
+//   - isActiveRouteContains current substr: whether current's path contains
+//     substr
+//
+// current is a *url.URL, a url.URL, an *http.Request or a path or URL string.
 func (r *Router) FuncMap() map[string]any {
 	return map[string]any{
 		"routePath": func(name string) string {
@@ -868,28 +1089,24 @@ func (r *Router) FuncMap() map[string]any {
 		"routeURL": func(name string, params map[string]any, scheme string) string {
 			return r.RouteURL(name, params, scheme)
 		},
-		"isActiveRoute": func(u *url.URL, name string) bool {
-			path := r.RoutePath(name)
-			if path == "" || u == nil {
-				return false
+		"route":    r.RoutePathArgs,
+		"hasRoute": r.HasRoute,
+		"routeOr": func(name string, fallback string, args ...any) (string, error) {
+			if !r.HasRoute(name) {
+				return fallback, nil
 			}
 
-			return strings.HasPrefix(u.Path, path)
+			return r.RoutePathArgs(name, args...)
 		},
-		"isActiveRouteExact": func(u *url.URL, name string) bool {
-			path := r.RoutePath(name)
-			if path == "" || u == nil {
-				return false
+		"isActiveRoute":      r.IsActiveRoute,
+		"isActiveRouteExact": r.IsActiveRouteExact,
+		"isActiveRouteContains": func(current any, substr string) (bool, error) {
+			currentURL, err := toCurrentURL(current)
+			if err != nil || currentURL == nil {
+				return false, err
 			}
 
-			return u.Path == path
-		},
-		"isActiveRouteContains": func(u *url.URL, substr string) bool {
-			if u == nil {
-				return false
-			}
-
-			return strings.Contains(u.Path, substr)
+			return strings.Contains(currentURL.Path, substr), nil
 		},
 	}
 }
@@ -914,12 +1131,19 @@ func (r *Router) targetMuxLocked(hostPattern string) *http.ServeMux {
 		return r.mux
 	}
 
+	return r.hostMuxLocked(hostPattern)
+}
+
+// hostMuxLocked returns the ServeMux of a host pattern, made on first use.
+func (r *Router) hostMuxLocked(hostPattern string) *http.ServeMux {
 	if mux, exists := r.hostMuxes[hostPattern]; exists {
 		return mux
 	}
 
 	mux := http.NewServeMux()
 	r.hostMuxes[hostPattern] = mux
+	r.recordLocked(mountChange{kind: hostAdded, host: hostPattern})
+
 	return mux
 }
 
@@ -929,83 +1153,36 @@ func (r *Router) registerRouteInfoLocked(hostPattern string, method string, patt
 	routeInfo := RouteInfo{
 		Method:      method,
 		Path:        routeNamePath(pattern),
+		Pattern:     pattern,
 		Host:        hostPattern,
 		Handler:     handler,
 		Middlewares: append([]Middleware{}, middlewares...),
+		// Mount registers with the method "*", which no route has.
+		Mount: method == "*",
 	}
 
+	r.addRouteLocked(routeInfo, "duplicate route", func() {
+		register(r.targetMuxLocked(hostPattern))
+	})
+}
+
+// addRouteLocked adds a route to the route list, after register, if any,
+// registered its handler. A route is its host, method and pattern, and can
+// only be added once.
+func (r *Router) addRouteLocked(routeInfo RouteInfo, duplicate string, register func()) {
 	key := routeKey(routeInfo)
 	if _, exists := r.routeKeys[key]; exists {
-		panic(fmt.Sprintf("router: duplicate route %s %s %s", routeInfo.Host, routeInfo.Method, routeInfo.Path))
+		panic(fmt.Sprintf("router: %s %s %s %s", duplicate, routeInfo.Host, routeInfo.Method, routeInfo.Pattern))
 	}
-	r.routeKeys[key] = struct{}{}
 
-	register(r.targetMuxLocked(hostPattern))
+	if register != nil {
+		register()
+	}
+
+	r.routeKeys[key] = len(r.routeList)
 	r.routeList = append(r.routeList, routeInfo)
-}
-
-func (r *Router) mountRouterLocked(hostPattern string, mountPath string, mountedRouter *Router) {
-	r.ensureMutableLocked()
-
-	mountedRoot := mountedRouter.rootParent()
-
-	for name, routeInfo := range mountedRoot.routes {
-		routeInfo.Host = firstNonEmpty(routeInfo.Host, hostPattern)
-		routeInfo.Path = joinPaths(mountPath, routeInfo.Path)
-		if existing, exists := r.routes[name]; exists && (existing.Method != routeInfo.Method || existing.Path != routeInfo.Path || existing.Host != routeInfo.Host) {
-			panic(fmt.Sprintf("router: duplicate route name %q", name))
-		}
-		r.routes[name] = routeInfo
-	}
-
-	for _, routeInfo := range mountedRoot.routeList {
-		routeInfo.Host = firstNonEmpty(routeInfo.Host, hostPattern)
-		routeInfo.Path = joinPaths(mountPath, routeInfo.Path)
-		key := routeKey(routeInfo)
-		if _, exists := r.routeKeys[key]; exists {
-			panic(fmt.Sprintf("router: duplicate mounted route %s %s %s", routeInfo.Host, routeInfo.Method, routeInfo.Path))
-		}
-		r.routeKeys[key] = struct{}{}
-		r.routeList = append(r.routeList, routeInfo)
-	}
-
-	r.mergeMountedOpenAPILocked(mountPath, mountedRoot)
-}
-
-func (r *Router) mergeMountedOpenAPILocked(mountPath string, mountedRoot *Router) {
-	if r.openapi == nil || mountedRoot.openapi == nil {
-		return
-	}
-
-	for path, pathItem := range mountedRoot.openapi.Paths {
-		mountedPath := joinPaths(mountPath, path)
-		existing := r.openapi.Paths[mountedPath]
-		r.openapi.Paths[mountedPath] = mergePathItem(existing, pathItem)
-		r.patternMap[mountedPath] = mountedPath
-	}
-
-	if r.openapi.Components.Schemas == nil {
-		r.openapi.Components.Schemas = make(map[string]Schema)
-	}
-	for name, schema := range mountedRoot.openapi.Components.Schemas {
-		if _, exists := r.openapi.Components.Schemas[name]; !exists {
-			r.openapi.Components.Schemas[name] = schema
-		}
-	}
-
-	if len(mountedRoot.openapi.Components.SecuritySchemes) > 0 {
-		if r.openapi.Components.SecuritySchemes == nil {
-			r.openapi.Components.SecuritySchemes = make(map[string]SecurityScheme)
-		}
-		for name, securityScheme := range mountedRoot.openapi.Components.SecuritySchemes {
-			if _, exists := r.openapi.Components.SecuritySchemes[name]; !exists {
-				r.openapi.Components.SecuritySchemes[name] = securityScheme
-			}
-		}
-	}
-
-	r.openapi.Tags = appendMissingTags(r.openapi.Tags, mountedRoot.openapi.Tags)
-	r.openapi.Security = append(r.openapi.Security, mountedRoot.openapi.Security...)
+	r.addMethodLocked(routeInfo.Method)
+	r.recordLocked(mountChange{kind: routeAdded, route: routeInfo})
 }
 
 func mergePathItem(base PathItem, mounted PathItem) PathItem {
@@ -1034,13 +1211,15 @@ func mergePathItem(base PathItem, mounted PathItem) PathItem {
 	return base
 }
 
-func (r *Router) shouldRedirectTrailingSlash(req *http.Request) bool {
-	if req.URL.Path == "/" || req.URL.Path == "" || req.URL.Path[len(req.URL.Path)-1] != '/' {
+// redirectsTrailingSlash reports whether the router redirects path, on
+// host, to the path without its trailing slash (RedirectTrailingSlash).
+func (r *Router) redirectsTrailingSlash(host string, path string) bool {
+	if path == "/" || path == "" || path[len(path)-1] != '/' {
 		return false
 	}
 
 	rootRouter := r.rootParent()
-	host := normalizeRequestHost(req.Host)
+	host = normalizeRequestHost(host)
 
 	rootRouter.mu.RLock()
 	defer rootRouter.mu.RUnlock()
@@ -1059,7 +1238,8 @@ func (r *Router) shouldRedirectTrailingSlash(req *http.Request) bool {
 		if prefix == "" {
 			prefix = "/"
 		}
-		if !pathHasPrefix(req.URL.Path, prefix) {
+
+		if !pathHasPrefix(path, prefix) {
 			continue
 		}
 
@@ -1159,17 +1339,6 @@ func normalizeRequestHost(host string) string {
 	return strings.TrimSuffix(host, ".")
 }
 
-func joinPaths(base string, path string) string {
-	if base == "" || base == "/" {
-		return routeNamePath(path)
-	}
-	if path == "" || path == "/" {
-		return routeNamePath(base)
-	}
-
-	return routeNamePath(strings.TrimSuffix(base, "/") + "/" + strings.TrimPrefix(path, "/"))
-}
-
 func pathHasPrefix(path string, prefix string) bool {
 	if prefix == "/" {
 		return true
@@ -1186,22 +1355,10 @@ func firstNonEmpty(value string, fallback string) string {
 	return fallback
 }
 
-func routeURLHost(host string, params map[string]any) string {
-	if !strings.HasPrefix(host, "*.") {
-		return host
-	}
-
-	for _, key := range []string{"subdomain", "tenant"} {
-		if value, exists := params[key]; exists {
-			return url.PathEscape(toString(value)) + strings.TrimPrefix(host, "*")
-		}
-	}
-
-	return host
-}
-
+// routeKey identifies a route by its host, method and registered pattern:
+// "/users" and "/users/", or "/admin/" and "/admin/{$}", are different routes.
 func routeKey(routeInfo RouteInfo) string {
-	return routeInfo.Host + "\x00" + routeInfo.Method + "\x00" + routeInfo.Path
+	return routeInfo.Host + "\x00" + routeInfo.Method + "\x00" + routeInfo.Pattern
 }
 
 func appendMissingTags(tags []Tag, mountedTags []Tag) []Tag {
@@ -1218,14 +1375,13 @@ func appendMissingTags(tags []Tag, mountedTags []Tag) []Tag {
 	return tags
 }
 
+// routeNamePath is the path of a pattern for reverse routing: the pattern
+// without {$}, keeping its trailing slash, so "/admin/{$}" and "/admin/"
+// are "/admin/" and "/{$}" is "/".
 func routeNamePath(pattern string) string {
 	pattern = strings.ReplaceAll(pattern, "{$}", "")
 	if pattern == "" {
 		return "/"
-	}
-
-	if len(pattern) > 1 {
-		pattern = strings.TrimSuffix(pattern, "/")
 	}
 
 	return pattern
@@ -1236,9 +1392,9 @@ func toString(v any) string {
 	case string:
 		return val
 	case int:
-		return fmt.Sprintf("%d", val)
+		return strconv.Itoa(val)
 	case int64:
-		return fmt.Sprintf("%d", val)
+		return strconv.FormatInt(val, 10)
 	case float64:
 		return fmt.Sprintf("%v", val)
 	default:
@@ -1257,14 +1413,17 @@ func (r *Router) registerDocs(method, pattern string, docs ...Docs) {
 	)
 
 	rootRouter := r.rootParent()
-	rootRouter.mu.Lock()
-	defer rootRouter.mu.Unlock()
-	rootRouter.ensureMutableLocked()
+	rootRouter.update(func() {
+		rootRouter.ensureMutableLocked()
+		r.registerDocsLocked(rootRouter, method, pattern, stripPattern, doc)
+	})
+}
 
+func (r *Router) registerDocsLocked(rootRouter *Router, method, pattern, stripPattern string, doc *Docs) {
 	rootRouter.patternMap[stripPattern] = pattern
 
-	// Get or create RouteInfo for the pattern
-	pathItem, exists := rootRouter.openapi.Paths[pattern]
+	// Get or create the path item of the pattern, kept by its stripped form.
+	pathItem, exists := rootRouter.openapi.Paths[stripPattern]
 	if !exists {
 		pathItem = PathItem{}
 	}
@@ -1311,6 +1470,7 @@ func (r *Router) registerDocs(method, pattern string, docs ...Docs) {
 	}
 
 	rootRouter.openapi.Paths[stripPattern] = pathItem.SetMethod(method, op)
+	rootRouter.recordDocsLocked(stripPattern)
 }
 
 func (r *Router) rootParent() *Router {
@@ -1320,11 +1480,34 @@ func (r *Router) rootParent() *Router {
 	return r.parent.rootParent()
 }
 
+// freeze stops registration on the router and on the routers mounted on it,
+// whose routes were copied into this one when they were mounted, and
+// installs the handlers for unmatched requests (NotFound).
 func (r *Router) freeze() {
 	rootRouter := r.rootParent()
 	rootRouter.freezeOnce.Do(func() {
 		rootRouter.mu.Lock()
 		rootRouter.frozen = true
+		mounted := slices.Clone(rootRouter.mounted)
+		rootRouter.mu.Unlock()
+
+		tracks := rootRouter.trackRoutes
+
+		for _, mountedRouter := range mounted {
+			mountedRouter.freeze()
+			tracks = tracks || mountedRouter.tracks
+		}
+
+		rootRouter.installFallbacks(false)
+
+		rootRouter.mu.Lock()
+		rootRouter.tracks = tracks
+		rootRouter.slashRoutes = rootRouter.hasSlashRouteLocked()
+
+		for _, link := range rootRouter.mountedOn {
+			rootRouter.wrapped = rootRouter.wrapped || link.wrapper
+		}
+
 		rootRouter.mu.Unlock()
 	})
 }
@@ -1382,6 +1565,15 @@ func (r *Router) registerOptionsHandler(strippedPattern string) {
 	rootRouter.mu.Lock()
 	defer rootRouter.mu.Unlock()
 
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			slog.Default().Warn("router: automatic OPTIONS handler not registered",
+				slog.String("path", strippedPattern),
+				slog.Any("error", recovered),
+			)
+		}
+	}()
+
 	// Get the original pattern
 	pattern, exists := rootRouter.patternMap[strippedPattern]
 	if !exists {
@@ -1390,9 +1582,16 @@ func (r *Router) registerOptionsHandler(strippedPattern string) {
 
 	// Get methods for the pattern
 	routeInfo, exists := rootRouter.openapi.Paths[pattern]
-	if !exists || len(routeInfo.Methods()) == 0 {
+	if !exists || len(routeInfo.Methods()) == 0 || routeInfo.Options != nil {
 		return
 	}
+
+	// An explicitly registered OPTIONS route wins over the automatic one.
+	if _, explicit := rootRouter.routeKeys[routeKey(RouteInfo{Method: http.MethodOptions, Pattern: pattern})]; explicit {
+		return
+	}
+
+	slog.Default().Debug("router: registering OPTIONS handler", slog.String("path", pattern))
 
 	// Create the OPTIONS handler with the Allow header
 	methods := addIfMissing(routeInfo.Methods(), http.MethodOptions, true)
