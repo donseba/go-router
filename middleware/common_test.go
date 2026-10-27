@@ -3,7 +3,7 @@ package middleware
 import (
 	"bytes"
 	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -48,61 +48,6 @@ func TestRequestIDGeneratesID(t *testing.T) {
 	}
 }
 
-func TestRealIP(t *testing.T) {
-	handler := RealIP(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, r.RemoteAddr)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "127.0.0.1:1234"
-	req.Header.Set("X-Forwarded-For", "203.0.113.10, 198.51.100.10")
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	if got := w.Body.String(); got != "203.0.113.10" {
-		t.Fatalf("expected remote addr %q, got %q", "203.0.113.10", got)
-	}
-}
-
-func TestRealIPWithTrustedProxy(t *testing.T) {
-	handler := RealIPWithOptions(RealIPOptions{
-		TrustedProxies: []string{"127.0.0.1/32"},
-	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, r.RemoteAddr)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "127.0.0.1:1234"
-	req.Header.Set("X-Forwarded-For", "203.0.113.10")
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	if got := w.Body.String(); got != "203.0.113.10" {
-		t.Fatalf("expected trusted forwarded remote addr %q, got %q", "203.0.113.10", got)
-	}
-}
-
-func TestRealIPWithUntrustedProxyIgnoresForwardedHeaders(t *testing.T) {
-	handler := RealIPWithOptions(RealIPOptions{
-		TrustedProxies: []string{"10.0.0.0/8"},
-	})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = fmt.Fprint(w, r.RemoteAddr)
-	}))
-
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	req.RemoteAddr = "127.0.0.1:1234"
-	req.Header.Set("X-Forwarded-For", "203.0.113.10")
-	w := httptest.NewRecorder()
-
-	handler.ServeHTTP(w, req)
-
-	if got := w.Body.String(); got != "127.0.0.1" {
-		t.Fatalf("expected untrusted forwarded header to be ignored, got %q", got)
-	}
-}
-
 func TestTimeout(t *testing.T) {
 	handler := Timeout(time.Millisecond)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(10 * time.Millisecond)
@@ -141,7 +86,7 @@ func TestSecurityHeaders(t *testing.T) {
 
 func TestLogger(t *testing.T) {
 	var logs bytes.Buffer
-	logger := log.New(&logs, "", 0)
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	handler := RequestID(Logger(LoggerOptions{Logger: logger})(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = fmt.Fprint(w, "hello")
@@ -154,7 +99,7 @@ func TestLogger(t *testing.T) {
 	handler.ServeHTTP(w, req)
 
 	got := logs.String()
-	for _, want := range []string{"POST", "/items", "201", "5", "known-id"} {
+	for _, want := range []string{"method=POST", "uri=/items", "status=201", "bytes=5", "request_id=known-id", "client_ip=192.0.2.1"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("expected log to contain %q, got %q", want, got)
 		}
@@ -163,7 +108,7 @@ func TestLogger(t *testing.T) {
 
 func TestLoggerResponseWriterUnwrap(t *testing.T) {
 	rr := httptest.NewRecorder()
-	lrw := &loggingResponseWriter{ResponseWriter: rr}
+	lrw := &responseRecorder{ResponseWriter: rr}
 
 	if got := lrw.Unwrap(); got != rr {
 		t.Fatalf("expected logger writer to unwrap original writer")

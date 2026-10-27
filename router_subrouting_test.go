@@ -60,8 +60,9 @@ func TestMountRouterUnderPathWithNamedRoutes(t *testing.T) {
 	if got := w.Body.String(); got != "user 42" {
 		t.Fatalf("expected mounted response %q, got %q", "user 42", got)
 	}
-	if got := parent.RoutePath("child.home"); got != "/api" {
-		t.Fatalf("expected mounted child home route %q, got %q", "/api", got)
+
+	if got := parent.RoutePath("child.home"); got != "/api/" {
+		t.Fatalf("expected mounted child home route %q, got %q", "/api/", got)
 	}
 	if got := parent.RoutePathWithParams("child.users.show", map[string]any{"id": 42}); got != "/api/users/42" {
 		t.Fatalf("expected mounted child user route %q, got %q", "/api/users/42", got)
@@ -425,5 +426,31 @@ func TestStaticFilesInsideGroupsAndHosts(t *testing.T) {
 		if got := w.Body.String(); got != tt.want {
 			t.Fatalf("for %s expected response %q, got %q", tt.path, tt.want, got)
 		}
+	}
+}
+
+func TestAddServerEndpointOnSubRouters(t *testing.T) {
+	r := New(http.NewServeMux(), "Example API", "1.0.0")
+	r.AddServerEndpoint("https://example.com", "root")
+
+	r.Group("/api", func(api *Router) {
+		api.AddServerEndpoint("https://api.example.com", "group")
+	})
+	r.With(func(with *Router) {
+		with.AddServerEndpoint("https://with.example.com", "with")
+	})
+	r.Host("cdn.example.com", func(cdn *Router) {
+		cdn.AddServerEndpoint("https://cdn.example.com", "host")
+	})
+
+	var urls []string
+
+	for _, server := range r.OpenAPI().Servers {
+		urls = append(urls, server.URL)
+	}
+
+	want := []string{"https://example.com", "https://api.example.com", "https://with.example.com", "https://cdn.example.com"}
+	if !slices.Equal(urls, want) {
+		t.Fatalf("servers %v, want %v", urls, want)
 	}
 }

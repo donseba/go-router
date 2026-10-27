@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -12,7 +12,9 @@ import (
 
 func TestContentLengthFlushStreamsThroughLogger(t *testing.T) {
 	rec := httptest.NewRecorder()
-	handler := Logger(LoggerOptions{Logger: log.New(io.Discard, "", 0)})(ContentLengthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	logged := Logger(LoggerOptions{Logger: logger})
+	handler := logged(ContentLengthMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.WriteHeader(http.StatusCreated)
 		_, _ = fmt.Fprint(w, "data: first\n\n")

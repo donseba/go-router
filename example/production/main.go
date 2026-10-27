@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"time"
@@ -13,17 +14,11 @@ import (
 )
 
 func main() {
-	r := router.New(http.NewServeMux(), "Production Example", "1.0.0")
+	r := router.NewSite()
 	r.RedirectTrailingSlash(true)
 
-	r.Use(middleware.RequestID)
-	r.Use(middleware.RealIPWithOptions(middleware.RealIPOptions{
-		TrustedProxies: []string{"127.0.0.1/32", "::1/128"},
-	}))
-	r.Use(middleware.Logger())
-	r.Use(middleware.Recover)
+	// Route middleware: applies to the routes registered after it.
 	r.Use(middleware.Timeout(10 * time.Second))
-	r.Use(middleware.SecurityHeaders())
 
 	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
 		_, _ = fmt.Fprintln(w, "public site")
@@ -44,7 +39,20 @@ func main() {
 		}).As("tenant.dashboard")
 	})
 
-	log.Println("listening on :8080")
+	// Request-wide middleware runs around the whole router, so that it also
+	// sees redirects, 404 and 405 responses and HandleStatus handlers: the
+	// security headers are on every response, not only on routes.
+	r.UseAll(
+		middleware.RequestID,
+		middleware.RealIPWithOptions(middleware.RealIPOptions{
+			TrustedProxies: []string{"127.0.0.1/32", "::1/128"},
+		}),
+		middleware.Logger(),
+		middleware.Recover,
+		middleware.SecurityHeaders(),
+	)
+
+	slog.Info("listening", "addr", ":8080")
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
 

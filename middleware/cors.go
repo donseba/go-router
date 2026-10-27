@@ -17,6 +17,9 @@ type CORSOptions struct {
 }
 
 // CORS returns a Middleware that handles Cross-Origin Resource Sharing.
+// Every answer says Vary: Origin, also one to a request without an Origin,
+// so that a shared cache keeps such an answer, without CORS headers, apart
+// from the answers to the allowed origins.
 func CORS(options CORSOptions) func(http.Handler) http.Handler {
 	// Preprocess allowed origins to support wildcards
 	var allowAllOrigins bool
@@ -35,13 +38,13 @@ func CORS(options CORSOptions) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Add("Vary", "Origin")
+
 			origin := req.Header.Get("Origin")
 			if origin == "" {
 				next.ServeHTTP(w, req)
 				return
 			}
-
-			w.Header().Add("Vary", "Origin")
 
 			var allowedOrigin string
 			if allowAllOrigins {
