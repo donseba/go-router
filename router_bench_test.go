@@ -49,7 +49,7 @@ func BenchmarkRouter(b *testing.B) {
 	for i := 0; i < numRoutes; i++ {
 		path := fmt.Sprintf("/users/%d", i)
 		router.Get(path, func(w http.ResponseWriter, r *http.Request) {
-			fmt.Fprint(w, "User")
+			_, _ = fmt.Fprint(w, "User")
 		})
 	}
 
@@ -58,7 +58,7 @@ func BenchmarkRouter(b *testing.B) {
 		for i := 0; i < numRoutes; i++ {
 			path := fmt.Sprintf("/items/%d", i)
 			api.Get(path, func(w http.ResponseWriter, r *http.Request) {
-				fmt.Fprint(w, "Item")
+				_, _ = fmt.Fprint(w, "Item")
 			})
 		}
 	})
