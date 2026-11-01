@@ -717,8 +717,8 @@ func (r *Router) serve(w http.ResponseWriter, req *http.Request) {
 	mux.ServeHTTP(interceptor, req)
 
 	if interceptor.intercepted {
-		switch {
-		case interceptor.statusCode == http.StatusMethodNotAllowed:
+		switch interceptor.statusCode {
+		case http.StatusMethodNotAllowed:
 			// Set the Allow header
 			pattern := req.URL.Path
 			allowedMethods := r.getMethodsForPattern(pattern)
@@ -1441,13 +1441,11 @@ func (r *Router) registerDocsLocked(rootRouter *Router, method, pattern, stripPa
 
 	// handle doc out
 	componentSchema, routeResponse := r.handleDocOut(doc.Out, rootRouter.openapi.Components.Schemas)
-	if componentSchema != nil {
-		for na, cs := range componentSchema {
-			if _, ex := rootRouter.openapi.Components.Schemas[na]; ex {
-				continue
-			}
-			rootRouter.openapi.Components.Schemas[na] = cs
+	for na, cs := range componentSchema {
+		if _, ex := rootRouter.openapi.Components.Schemas[na]; ex {
+			continue
 		}
+		rootRouter.openapi.Components.Schemas[na] = cs
 	}
 
 	if routeResponse != nil {
@@ -1456,13 +1454,11 @@ func (r *Router) registerDocsLocked(rootRouter *Router, method, pattern, stripPa
 
 	// handle doc in
 	componentSchema, requestBody := r.handleDocIn(doc.In, rootRouter.openapi.Components.Schemas)
-	if componentSchema != nil {
-		for na, cs := range componentSchema {
-			if _, ex := rootRouter.openapi.Components.Schemas[na]; ex {
-				continue
-			}
-			rootRouter.openapi.Components.Schemas[na] = cs
+	for na, cs := range componentSchema {
+		if _, ex := rootRouter.openapi.Components.Schemas[na]; ex {
+			continue
 		}
+		rootRouter.openapi.Components.Schemas[na] = cs
 	}
 
 	if requestBody != nil {
@@ -1615,7 +1611,7 @@ func (r *Router) OperationID(s string) string {
 			continue
 		}
 		part = strings.TrimRight(strings.TrimLeft(part, "{"), "}")
-		parts[i] = strings.Title(part)
+		parts[i] = strings.Title(part) //nolint:staticcheck // keeps the operation IDs that existing OpenAPI documents use.
 	}
 	return strings.Join(parts, "")
 }
@@ -1719,7 +1715,7 @@ func schemaForType(t reflect.Type, existingSchemas map[string]Schema, components
 	}
 
 	nullable := false
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		nullable = true
 		t = t.Elem()
 	}
@@ -1784,10 +1780,10 @@ func schemaForStruct(t reflect.Type, existingSchemas map[string]Schema, componen
 		fieldSchema := schemaForType(field.Type, existingSchemas, components)
 		if field.Anonymous {
 			fieldType := field.Type
-			for fieldType.Kind() == reflect.Ptr {
+			for fieldType.Kind() == reflect.Pointer {
 				fieldType = fieldType.Elem()
 			}
-			if fieldType.Kind() == reflect.Struct && !(fieldType.PkgPath() == "time" && fieldType.Name() == "Time") {
+			if fieldType.Kind() == reflect.Struct && (fieldType.PkgPath() != "time" || fieldType.Name() != "Time") {
 				fieldSchema = schemaForStruct(fieldType, existingSchemas, components)
 			}
 		}

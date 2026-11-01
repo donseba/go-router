@@ -31,7 +31,7 @@ func TestCORSMiddleware(t *testing.T) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		//w.Header().Set("Content-Length", strconv.Itoa(len(responseBody)))
 		w.WriteHeader(http.StatusOK)
-		w.Write(responseBody)
+		_, _ = w.Write(responseBody)
 	})
 
 	// Wrap the test handler with the CORS middleware
