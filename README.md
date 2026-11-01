@@ -6,6 +6,9 @@
 
 # go-router
 
+[![Go Reference](https://pkg.go.dev/badge/github.com/donseba/go-router.svg)](https://pkg.go.dev/github.com/donseba/go-router)
+[![codecov](https://codecov.io/gh/donseba/go-router/graph/badge.svg)](https://codecov.io/gh/donseba/go-router)
+
 [Documentation](https://docs.gowebthings.com/go-router) · Part of [go-webthings](https://gowebthings.com/components).
 
 `go-router` is a lightweight router for Go websites and APIs. It builds on the standard library `net/http` `ServeMux` and adds the pieces most small and medium applications usually end up needing: route groups, middleware, named routes, host and subdomain routing, mounted routers, OpenAPI helpers, route walking, static files, and practical middleware.
