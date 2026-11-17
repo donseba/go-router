@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"slices"
 )
 
 // LoggerOptions configures Logger.
@@ -70,8 +71,10 @@ func Logger(options ...LoggerOptions) func(http.Handler) http.Handler {
 //	logger := slog.New(middleware.LogHandler(slog.NewJSONHandler(os.Stderr, nil)))
 //	logger.InfoContext(req.Context(), "page saved") // ... request_id=...
 //
-// Records that name a request_id already, such as those of Logger and
-// Recover, keep theirs. Wrapping a handler twice wraps it once.
+// Records also carry the attributes WithLogAttrs put in their context, such
+// as the site of a process that serves several. Records that name a key
+// already, such as the request_id of Logger and Recover, keep their own
+// value. Wrapping a handler twice wraps it once.
 func LogHandler(handler slog.Handler) slog.Handler {
 	if _, ok := handler.(logHandler); ok {
 		return handler
@@ -85,8 +88,14 @@ type logHandler struct {
 }
 
 func (h logHandler) Handle(ctx context.Context, record slog.Record) error {
-	if id := GetRequestID(ctx); id != "" && !hasRequestID(record) {
+	if id := GetRequestID(ctx); id != "" && !hasKey(record, "request_id") {
 		record.AddAttrs(slog.String("request_id", id))
+	}
+
+	for _, attr := range LogAttrs(ctx) {
+		if !hasKey(record, attr.Key) {
+			record.AddAttrs(attr)
+		}
 	}
 
 	return h.Handler.Handle(ctx, record)
@@ -100,17 +109,51 @@ func (h logHandler) WithGroup(name string) slog.Handler {
 	return logHandler{Handler: h.Handler.WithGroup(name)}
 }
 
-// hasRequestID reports whether the record names a request ID itself.
-func hasRequestID(record slog.Record) bool {
+// hasKey reports whether the record names key itself.
+func hasKey(record slog.Record, key string) bool {
 	found := false
 
 	record.Attrs(func(attr slog.Attr) bool {
-		found = attr.Key == "request_id"
+		found = attr.Key == key
 
 		return !found
 	})
 
 	return found
+}
+
+type logAttrsContextKey struct{}
+
+// WithLogAttrs returns ctx carrying attrs after those it carries already.
+// LogHandler adds them to every record logged with ctx, or with a context
+// made from it, such as that of a request or of background work:
+//
+//	ctx = middleware.WithLogAttrs(ctx, slog.String("site", "example.com"))
+//	logger.InfoContext(ctx, "page saved") // ... site=example.com
+//
+// A process that serves several sites puts the site in the context of each
+// request and of each site's background work, so their records can be told
+// apart without passing a logger around.
+func WithLogAttrs(ctx context.Context, attrs ...slog.Attr) context.Context {
+	if len(attrs) == 0 {
+		return ctx
+	}
+
+	carried := append(slices.Clip(LogAttrs(ctx)), attrs...)
+
+	return context.WithValue(ctx, logAttrsContextKey{}, carried)
+}
+
+// LogAttrs returns the attributes WithLogAttrs put in ctx, oldest first, or
+// nil.
+func LogAttrs(ctx context.Context) []slog.Attr {
+	if ctx == nil {
+		return nil
+	}
+
+	attrs, _ := ctx.Value(logAttrsContextKey{}).([]slog.Attr)
+
+	return attrs
 }
 
 // loggerOrDefault returns logger, or slog.Default() when it is nil: the

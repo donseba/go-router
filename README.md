@@ -619,7 +619,7 @@ log.Fatal(http.ListenAndServe(":8080", handler))
 The bundled middleware package includes:
 
 - `RequestID`, `RequestIDWithOptions`
-- `Logger`, `Observe`, `LogHandler`
+- `Logger`, `Observe`, `LogHandler`, `WithLogAttrs`
 - `Recover`, `RecoverWithOptions`
 - `Timeout`
 - `RealIP`, `RealIPWithOptions`, `TryRealIP`, and `Scheme`, `Host`, `Origin`, `SameOrigin`, `SameOriginReferer`
@@ -748,6 +748,15 @@ r.Use(middleware.Observe(func(req *http.Request, info middleware.ResponseInfo) {
 logger := slog.New(middleware.LogHandler(slog.NewJSONHandler(os.Stderr, nil)))
 logger.InfoContext(req.Context(), "page saved") // ... "request_id": "..."
 ```
+
+`WithLogAttrs` puts attributes in a context, and `LogHandler` adds them to every record logged with that context or one made from it. A process that serves several sites can tell their records apart that way, without passing a logger around. It puts the site in the context of each request, and in the context its background work starts from:
+
+```go
+ctx = middleware.WithLogAttrs(ctx, slog.String("site", "example.com"))
+logger.InfoContext(ctx, "page saved") // ... "site": "example.com"
+```
+
+The attributes follow the request ID, oldest first. A record that names a key itself keeps its own value. `LogAttrs(ctx)` returns the attributes a context carries.
 
 `Recover` logs the panic with its stack and writes a 500 if the response has not started. If it has, the connection is aborted with `http.ErrAbortHandler`, so clients and caches do not mistake a truncated response for a complete one. Panics with `http.ErrAbortHandler` are passed on untouched.
 

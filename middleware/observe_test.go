@@ -32,6 +32,48 @@ func TestLogHandler(t *testing.T) {
 	}
 }
 
+// TestWithLogAttrs checks that records carry the attributes of their context,
+// in order, after the request ID, and that a record naming a key keeps its
+// own value.
+func TestWithLogAttrs(t *testing.T) {
+	var log bytes.Buffer
+
+	base := WithLogAttrs(context.Background(), slog.String("site", "one"))
+	ctx := WithLogAttrs(WithRequestID(base, "abc"), slog.Int("worker", 2))
+	other := WithLogAttrs(base, slog.String("job", "cleanup"))
+
+	logger := slog.New(LogHandler(slog.NewTextHandler(&log, nil)))
+	logger.InfoContext(ctx, "request")
+	logger.InfoContext(other, "background")
+	logger.InfoContext(ctx, "named", "site", "two")
+	logger.Info("outside")
+
+	want := []string{
+		"msg=request request_id=abc site=one worker=2",
+		"msg=background site=one job=cleanup",
+		"msg=named site=two request_id=abc worker=2",
+		"msg=outside\n",
+	}
+
+	for _, line := range want {
+		if !strings.Contains(log.String(), line) {
+			t.Errorf("log lacks %q:\n%s", line, log.String())
+		}
+	}
+
+	if got := LogAttrs(base); len(got) != 1 || got[0].Key != "site" {
+		t.Fatalf("WithLogAttrs changed the attributes of its parent context: %v", got)
+	}
+
+	if got := LogAttrs(context.Background()); got != nil {
+		t.Fatalf("LogAttrs of a plain context: %v", got)
+	}
+
+	if WithLogAttrs(base) != base {
+		t.Fatal("WithLogAttrs without attributes made a new context")
+	}
+}
+
 // TestObserve checks the status, size and query-free access log of
 // requests.
 func TestObserve(t *testing.T) {
